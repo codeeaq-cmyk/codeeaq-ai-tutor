@@ -1,0 +1,21 @@
+{
+  "name": "codeeaq-ai-tutor",
+  "private": true,
+  "engines": {
+    "node": ">=22"
+  },
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "build:shared": "npm run build -w @codeeaq/shared-types",
+    "dev:web": "npm run dev -w tutor-web",
+    "dev:api": "npm run start:dev -w tutor-api",
+    "build": "npm run build:shared && npm run build -w tutor-api && npm run build -w tutor-web",
+    "test": "npm run test -w tutor-api",
+    "db:up": "docker compose up -d",
+    "db:down": "docker compose down",
+    "postinstall": "npm run build:shared"
+  }
+}
