@@ -43,6 +43,13 @@ Build the first working version of **Ceeq**, a conversational AI tutor that can:
 
 Phase 1 is an MVP. It should prove the complete teaching loop before adding advanced camera/vision, parent dashboards, school administration, or complex adaptive-learning algorithms.
 
+## Core product principle
+- Verbal & Visual
+- Whiteboard - draw and explain
+- Real-world examples
+- Interactive exercise
+- Practice question (same question asked in different way)
+
 ---
 
 # 2. Phase 1 Scope
