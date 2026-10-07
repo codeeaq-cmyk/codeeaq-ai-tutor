@@ -5,7 +5,7 @@ import {
   type GetSyllabusRequest,
   type Syllabus,
 } from '@codeeaq/shared-types';
-import { createAsker, extractJson } from '../ai';
+import { extractJson, type Ask } from '../ai';
 
 // A syllabus is compiled in two steps: first the list of subjects, then each
 // subject's chapters, all subjects in parallel. Small, single-subject answers
@@ -87,15 +87,13 @@ async function settleLimited<T>(tasks: (() => Promise<T>)[], limit: number): Pro
   return results;
 }
 
-export async function generateSyllabus(apiKey: string, models: string[], request: GetSyllabusRequest): Promise<Syllabus> {
-  // The subject list is short and benefits most from current web results.
-  const { edition, subjects: names } = await createAsker(apiKey, models, 'search-first')(
-    buildSubjectsPrompt(request),
-    parseSubjectsReply,
-  );
+/**
+ * `ask` should try fast answers before web search and be shared across
+ * requests, so it remembers which model responds: a student is waiting.
+ */
+export async function generateSyllabus(ask: Ask, request: GetSyllabusRequest): Promise<Syllabus> {
+  const { edition, subjects: names } = await ask(buildSubjectsPrompt(request), parseSubjectsReply);
 
-  // Chapters: fast answers first, web search only if those fail.
-  const ask = createAsker(apiKey, models, 'fast-first');
   const results = await settleLimited(
     names.map((name) => async () => ({ name, units: await ask(buildChaptersPrompt(request, name), parseChaptersReply) })),
     CONCURRENCY,

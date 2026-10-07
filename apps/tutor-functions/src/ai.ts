@@ -8,8 +8,10 @@ export type Ask = <T>(prompt: string, parse: (text: string) => T) => Promise<T>;
 /**
  * Asks the first model that answers. Models get refused for quota (429) or
  * load (503) independently, and web search has its own, often smaller, quota;
- * without it the model answers from its own knowledge, much faster. Once an
- * attempt works, later questions start with it instead of retrying refused ones.
+ * without it the model answers from its own knowledge, much faster. An attempt
+ * the service refused or that timed out is skipped for a while, so later
+ * questions don't pay for it again; a merely unusable answer is not held
+ * against the model.
  */
 export function createAsker(
   apiKey: string,
@@ -27,12 +29,16 @@ export function createAsker(
           { model, search: mode !== 'search-first' },
         ],
   );
-  let preferred = 0;
+  // When each attempt may be tried again, by index.
+  const skipUntil = new Map<number, number>();
 
   return async function ask<T>(prompt: string, parse: (text: string) => T): Promise<T> {
     let lastError: unknown = new Error('No text model configured');
-    for (let i = preferred; i < attempts.length; i++) {
+    // If everything is currently being skipped, try them all rather than fail outright.
+    const usable = attempts.map((_, i) => i).filter((i) => (skipUntil.get(i) ?? 0) <= Date.now());
+    for (const i of usable.length ? usable : attempts.map((_, index) => index)) {
       const { model, search } = attempts[i];
+      let text: string;
       try {
         const response = await ai.models.generateContent({
           model,
@@ -43,17 +49,26 @@ export function createAsker(
             abortSignal: AbortSignal.timeout(timeoutMs),
           },
         });
-        const result = parse(response.text ?? '');
-        preferred = Math.max(preferred, i);
-        return result;
+        text = response.text ?? '';
       } catch (err) {
+        // Refused (quota, overload, unknown model) or timed out: leave it alone for a while.
+        skipUntil.set(i, Date.now() + SKIP_REFUSED_MS);
         lastError = err;
         logger.warn('Model attempt failed', { model, search, err: String(err).slice(0, 200) });
+        continue;
+      }
+      try {
+        return parse(text);
+      } catch (err) {
+        lastError = err;
+        logger.warn('Model reply unusable', { model, search, err: String(err).slice(0, 200) });
       }
     }
     throw lastError;
   };
 }
+
+const SKIP_REFUSED_MS = 10 * 60 * 1000;
 
 /** Pulls the JSON object out of a reply that may be wrapped in prose or code fences. */
 export function extractJson(text: string): Record<string, unknown> {

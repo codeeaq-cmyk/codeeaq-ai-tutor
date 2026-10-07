@@ -25,9 +25,9 @@ import { mintVoiceToken } from './voice';
 setGlobalOptions({ region: FUNCTIONS_REGION, maxInstances: 10, invoker: 'public' });
 
 const geminiApiKey = defineSecret('GEMINI_API_KEY');
-// Tried in order; the lite models keep working when the larger ones are over quota or busy.
+// Tried in order, fastest and most available first: a student is waiting on every one of these calls.
 const textModels = defineString('GEMINI_SYLLABUS_MODELS', {
-  default: 'gemini-3.8-flash,gemini-3.5-flash-lite,gemini-flash-lite-latest',
+  default: 'gemini-3.5-flash-lite,gemini-flash-lite-latest,gemini-3.8-flash',
 });
 // Chapter plans and quizzes are requested while the student waits, so the fast models go first.
 const courseModels = defineString('GEMINI_COURSE_MODELS', {
@@ -50,6 +50,14 @@ function getCourseAsker(): Ask {
   const key = requireKey();
   if (courseAsker?.key !== key) courseAsker = { key, ask: createAsker(key, list(courseModels.value()), 'no-search', 20_000) };
   return courseAsker.ask;
+}
+
+// Syllabi try a fast answer first and web search only if that fails.
+let syllabusAsker: { key: string; ask: Ask } | undefined;
+function getSyllabusAsker(): Ask {
+  const key = requireKey();
+  if (syllabusAsker?.key !== key) syllabusAsker = { key, ask: createAsker(key, list(textModels.value()), 'fast-first', 20_000) };
+  return syllabusAsker.ask;
 }
 
 function text(value: unknown, max: number): string | undefined {
@@ -96,9 +104,9 @@ export const getSyllabus = onCall<GetSyllabusRequest, Promise<Syllabus>>(
     const curated = findCuratedSyllabus(query);
     if (curated) return curated;
 
-    const key = requireKey();
     try {
-      return await cachedSyllabus(query, () => generateSyllabus(key, list(textModels.value()), query));
+      const ask = getSyllabusAsker();
+      return await cachedSyllabus(query, () => generateSyllabus(ask, query));
     } catch (err) {
       logger.error('Syllabus generation failed', { query, err: String(err) });
       throw new HttpsError('unavailable', 'Could not load the syllabus right now. Please try again.');
