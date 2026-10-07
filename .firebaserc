@@ -1,0 +1,6 @@
+{
+  "projects": {
+    "default": "demo-ceeq",
+    "prod": "codeeaq-ai-tutor"
+  }
+}

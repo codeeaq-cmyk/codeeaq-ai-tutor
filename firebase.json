@@ -1,0 +1,32 @@
+{
+  "functions": [
+    {
+      "source": "apps/tutor-functions",
+      "codebase": "default",
+      "ignore": [
+        "node_modules",
+        "src",
+        "*.log",
+        "vitest.config.ts",
+        "tsconfig.json",
+        ".secret.local",
+        ".secret.local.example",
+        ".env.local",
+        ".env.example"
+      ],
+      "predeploy": [
+        "npm --prefix \"$RESOURCE_DIR\" run build"
+      ]
+    }
+  ],
+  "emulators": {
+    "functions": {
+      "port": 5001
+    },
+    "ui": {
+      "enabled": true,
+      "port": 4000
+    },
+    "singleProjectMode": true
+  }
+}

@@ -11,11 +11,13 @@
   "scripts": {
     "build:shared": "npm run build -w @codeeaq/shared-types",
     "dev:web": "npm run dev -w tutor-web",
-    "dev:api": "npm run start:dev -w tutor-api",
-    "build": "npm run build:shared && npm run build -w tutor-api && npm run build -w tutor-web",
-    "test": "npm run test -w tutor-api",
-    "db:up": "docker compose up -d",
-    "db:down": "docker compose down",
+    "dev:functions": "npm run build -w tutor-functions && firebase emulators:start --only functions",
+    "watch:functions": "npm run watch -w tutor-functions",
+    "build": "npm run build:shared && npm run build -w tutor-functions && npm run build -w tutor-web",
+    "test": "npm run test -w @codeeaq/shared-types && npm run test -w tutor-functions && npm run test -w tutor-web",
     "postinstall": "npm run build:shared"
+  },
+  "devDependencies": {
+    "firebase-tools": "^15.32.0"
   }
 }

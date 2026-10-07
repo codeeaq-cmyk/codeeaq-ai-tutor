@@ -13,3 +13,9 @@ next-env.d.ts
 
 .DS_Store
 *.log
+
+# Firebase
+lib/
+.firebase/
+.secret.local
+.runtimeconfig.json

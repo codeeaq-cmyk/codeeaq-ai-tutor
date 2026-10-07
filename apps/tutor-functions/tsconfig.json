@@ -1,0 +1,16 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "preserve",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "types": ["node"],
+    // Bundled in by esbuild, so the deployed package has no workspace dependency.
+    "paths": {
+      "@codeeaq/shared-types": ["../../packages/shared-types/src/index.ts"]
+    }
+  },
+  "include": ["src"]
+}
