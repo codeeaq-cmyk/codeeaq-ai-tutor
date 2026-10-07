@@ -15,7 +15,8 @@ next-env.d.ts
 *.log
 
 # Firebase
-lib/
+# Build output of the Cloud Functions only. A bare "lib/" would also hide apps/tutor-web/lib.
+apps/tutor-functions/lib/
 .firebase/
 .secret.local
 .runtimeconfig.json
