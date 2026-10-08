@@ -12,6 +12,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { GoogleGenAI, type LiveServerMessage, type Session } from "@google/genai";
 import type { StartVoiceResponse } from "@codeeaq/shared-types";
+import { TimeStretcher } from "./timeStretch";
 
 export type VoiceStatus = "idle" | "connecting" | "live" | "paused" | "error";
 export type VoiceActivity = "idle" | "listening" | "thinking" | "speaking";
@@ -21,16 +22,29 @@ export type ToolHandler = (name: string, args: Record<string, unknown>) => Recor
 interface Options {
   getToken: () => Promise<StartVoiceResponse>;
   onToolCall: ToolHandler;
+  /** How fast Ceeq's voice plays: 1 is as the model speaks, 0.85 is 15% slower. */
+  speed: number;
+  /**
+   * Ceeq has finished producing a turn. `remainingMs` is how much of it the
+   * student has yet to hear (slowed speech plays for longer than it takes to
+   * arrive). `afterStudent` is true when the turn answered something the
+   * student said or typed.
+   */
+  onTurnEnd?: (info: { afterStudent: boolean; remainingMs: number }) => void;
+  /** The student started speaking or sent a typed message. */
+  onStudentInput?: () => void;
 }
 
 const MIC_SAMPLE_RATE = 16000; // must match public/audio-processor.js
 const PLAYBACK_SAMPLE_RATE = 24000; // Gemini Live's output audio rate
 const TOKEN_TTL_MS = 8 * 60 * 1000; // tokens are minted for 10 minutes
 const IDLE_PAUSE_MS = 4 * 60 * 1000; // pause after this long without the student
+/** The pause left between one of Ceeq's turns and the next when they follow straight on. */
+const BREATH_SECONDS = 0.7;
 // While Ceeq speaks, mic chunks quieter than this are treated as her own echo.
 const BARGE_IN_RMS = 0.045;
 
-export function useCeeqVoice({ getToken, onToolCall }: Options) {
+export function useCeeqVoice({ getToken, onToolCall, speed, onTurnEnd, onStudentInput }: Options) {
   const [status, setStatus] = useState<VoiceStatus>("idle");
   const [activity, setActivity] = useState<VoiceActivity>("idle");
   const [micOn, setMicOn] = useState(false);
@@ -41,9 +55,26 @@ export function useCeeqVoice({ getToken, onToolCall }: Options) {
   const sessionRef = useRef<Session | null>(null);
   const generationRef = useRef(0);
   const toolRef = useRef(onToolCall);
+  const turnEndRef = useRef(onTurnEnd);
+  const studentInputRef = useRef(onStudentInput);
   useEffect(() => {
     toolRef.current = onToolCall;
-  }, [onToolCall]);
+    turnEndRef.current = onTurnEnd;
+    studentInputRef.current = onStudentInput;
+  }, [onToolCall, onTurnEnd, onStudentInput]);
+
+  // ---------- End of Ceeq's turn ----------
+  //
+  // The service says a turn is complete at about the moment its audio would
+  // finish at normal speed. Slowed audio is still playing then, so the caller
+  // is told how much is left and can time what happens next around it.
+
+  /** Audio for a turn has started arriving and the service has not yet said the turn is complete. */
+  const midTurnRef = useRef(false);
+  /** The current turn was cut short by the student, so its "complete" signal does not count. */
+  const interruptedRef = useRef(false);
+  /** The student said or typed something since Ceeq's last finished turn. */
+  const afterStudentRef = useRef(false);
 
   // ---------- Token prefetch ----------
 
@@ -75,6 +106,10 @@ export function useCeeqVoice({ getToken, onToolCall }: Options) {
   const sourcesRef = useRef<AudioBufferSourceNode[]>([]);
   const speakingRef = useRef(false);
   const newTurnRef = useRef(true);
+  /** The student has paused playback. */
+  const heldRef = useRef(false);
+  /** The next audio to be queued is the start of a new turn. */
+  const breathRef = useRef(false);
 
   const ensurePlayback = useCallback(() => {
     if (!playCtxRef.current) {
@@ -89,8 +124,20 @@ export function useCeeqVoice({ getToken, onToolCall }: Options) {
       analyserRef.current = analyser;
       nextStartRef.current = 0;
     }
-    if (playCtxRef.current.state === "suspended") void playCtxRef.current.resume();
+    // A context the student paused stays paused; audio that arrives meanwhile queues up.
+    if (playCtxRef.current.state === "suspended" && !heldRef.current) void playCtxRef.current.resume();
     return playCtxRef.current;
+  }, []);
+
+  /** Freezes Ceeq's voice exactly where it is. Nothing is lost: it carries on from there. */
+  const holdPlayback = useCallback(() => {
+    heldRef.current = true;
+    void playCtxRef.current?.suspend();
+  }, []);
+
+  const releasePlayback = useCallback(() => {
+    heldRef.current = false;
+    if (playCtxRef.current?.state === "suspended") void playCtxRef.current.resume();
   }, []);
 
   const levelBuffer = useRef<Uint8Array<ArrayBuffer> | null>(null);
@@ -110,6 +157,16 @@ export function useCeeqVoice({ getToken, onToolCall }: Options) {
     setActivity((a) => (speaking ? "speaking" : a === "speaking" ? "idle" : a));
   }, []);
 
+  // The voice model speaks at about 155 words a minute whatever it is told,
+  // so its audio is stretched in time (pitch unchanged) to the chosen pace.
+  const stretcherRef = useRef<TimeStretcher | null>(null);
+  const speedRef = useRef(speed);
+  useEffect(() => {
+    speedRef.current = speed;
+    stretcherRef.current?.setSpeed(speed);
+  }, [speed]);
+  const getStretcher = useCallback(() => (stretcherRef.current ??= new TimeStretcher(PLAYBACK_SAMPLE_RATE, speedRef.current)), []);
+
   const stopPlayback = useCallback(() => {
     sourcesRef.current.forEach((src) => {
       try {
@@ -119,24 +176,30 @@ export function useCeeqVoice({ getToken, onToolCall }: Options) {
       }
     });
     sourcesRef.current = [];
+    midTurnRef.current = false;
+    stretcherRef.current?.reset();
     nextStartRef.current = playCtxRef.current?.currentTime ?? 0;
     setSpeaking(false);
   }, [setSpeaking]);
 
-  const playChunk = useCallback(
-    (b64: string) => {
+  /** Queues audio to play right after whatever is already queued. */
+  const schedule = useCallback(
+    (samples: Float32Array) => {
+      if (!samples.length) return;
       const ctx = ensurePlayback();
-      const binary = atob(b64);
-      const bytes = new Uint8Array(binary.length);
-      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-      const int16 = new Int16Array(bytes.buffer, 0, bytes.byteLength >> 1);
-      const buffer = ctx.createBuffer(1, int16.length, PLAYBACK_SAMPLE_RATE);
-      buffer.copyToChannel(Float32Array.from(int16, (s) => s / 32768), 0);
+      const buffer = ctx.createBuffer(1, samples.length, PLAYBACK_SAMPLE_RATE);
+      buffer.getChannelData(0).set(samples);
 
       const src = ctx.createBufferSource();
       src.buffer = buffer;
       src.connect(outputRef.current!);
-      const startAt = Math.max(ctx.currentTime, nextStartRef.current);
+      let startAt = Math.max(ctx.currentTime, nextStartRef.current);
+      if (breathRef.current) {
+        // A new turn that would follow straight on from the last gets a short
+        // breath first, so paragraphs don't run together.
+        breathRef.current = false;
+        if (nextStartRef.current > 0) startAt = Math.max(startAt, nextStartRef.current + BREATH_SECONDS);
+      }
       src.start(startAt);
       nextStartRef.current = startAt + buffer.duration;
       sourcesRef.current.push(src);
@@ -148,6 +211,28 @@ export function useCeeqVoice({ getToken, onToolCall }: Options) {
     },
     [ensurePlayback, setSpeaking],
   );
+
+  /** How much queued speech the student has yet to hear. */
+  const remainingMs = useCallback(() => {
+    const ctx = playCtxRef.current;
+    return ctx ? Math.max(0, nextStartRef.current - ctx.currentTime) * 1000 : 0;
+  }, []);
+
+  const playChunk = useCallback(
+    (b64: string) => {
+      const binary = atob(b64);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      const int16 = new Int16Array(bytes.buffer, 0, bytes.byteLength >> 1);
+      schedule(getStretcher().process(Float32Array.from(int16, (s) => s / 32768)));
+    },
+    [getStretcher, schedule],
+  );
+
+  /** Plays out the last few milliseconds the stretcher was holding back. */
+  const finishUtterance = useCallback(() => {
+    if (stretcherRef.current) schedule(stretcherRef.current.flush());
+  }, [schedule]);
 
   // ---------- Idle pause ----------
 
@@ -185,11 +270,14 @@ export function useCeeqVoice({ getToken, onToolCall }: Options) {
       if (content.interrupted) {
         stopPlayback();
         newTurnRef.current = true;
+        interruptedRef.current = true;
       }
 
       const heardDelta = content.inputTranscription?.text;
       if (heardDelta) {
         touch();
+        afterStudentRef.current = true;
+        studentInputRef.current?.();
         setHeard((prev) => prev + heardDelta);
         if (!speakingRef.current) setActivity("listening");
         // Once the student's words stop arriving, Ceeq is working on a reply.
@@ -203,6 +291,9 @@ export function useCeeqVoice({ getToken, onToolCall }: Options) {
         if (!part.inlineData?.data) continue;
         if (newTurnRef.current) {
           newTurnRef.current = false;
+          interruptedRef.current = false;
+          midTurnRef.current = true;
+          breathRef.current = true;
           setCaption("");
         }
         playChunk(part.inlineData.data);
@@ -212,11 +303,21 @@ export function useCeeqVoice({ getToken, onToolCall }: Options) {
       if (spokenDelta) setCaption((prev) => prev + spokenDelta);
 
       if (content.turnComplete) {
+        finishUtterance();
         newTurnRef.current = true;
         setHeard("");
+        midTurnRef.current = false;
+        if (interruptedRef.current) {
+          // The student cut this turn short; Ceeq's reply to them is the turn that counts.
+          interruptedRef.current = false;
+        } else {
+          const afterStudent = afterStudentRef.current;
+          afterStudentRef.current = false;
+          turnEndRef.current?.({ afterStudent, remainingMs: remainingMs() });
+        }
       }
     },
-    [playChunk, stopPlayback, touch],
+    [finishUtterance, playChunk, remainingMs, stopPlayback, touch],
   );
 
   // ---------- Mic (hands-free) ----------
@@ -290,11 +391,14 @@ export function useCeeqVoice({ getToken, onToolCall }: Options) {
     if (thinkingTimerRef.current) clearTimeout(thinkingTimerRef.current);
     stopMic();
     stopPlayback();
+    releasePlayback();
+    interruptedRef.current = false;
+    afterStudentRef.current = false;
     sessionRef.current?.close();
     sessionRef.current = null;
     setActivity("idle");
     setHeard("");
-  }, [stopMic, stopPlayback]);
+  }, [releasePlayback, stopMic, stopPlayback]);
 
   const pause = useCallback(() => {
     teardown();
@@ -363,8 +467,13 @@ export function useCeeqVoice({ getToken, onToolCall }: Options) {
     (text: string) => {
       const trimmed = text.trim();
       if (!sessionRef.current || !trimmed) return false;
+      // Typing over Ceeq cuts her off, like speaking over her. If her turn was
+      // still under way, its "complete" signal is yet to come and must not count.
+      interruptedRef.current = midTurnRef.current;
       stopPlayback();
       newTurnRef.current = true;
+      afterStudentRef.current = true;
+      studentInputRef.current?.();
       setHeard(trimmed);
       setActivity("thinking");
       sessionRef.current.sendRealtimeInput({ text: trimmed });
@@ -417,6 +526,11 @@ export function useCeeqVoice({ getToken, onToolCall }: Options) {
     sendText,
     notify,
     getLevel,
+    /** Whether a turn is still arriving from Ceeq, for use outside render. */
+    isMidTurn: () => midTurnRef.current,
+    remainingMs,
+    holdPlayback,
+    releasePlayback,
   };
 }
 

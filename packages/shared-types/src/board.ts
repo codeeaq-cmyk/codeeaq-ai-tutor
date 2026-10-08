@@ -5,6 +5,10 @@
 export const BOARD_COLORS = ['accent', 'blue', 'green', 'amber', 'red', 'gray'] as const;
 export type BoardColor = (typeof BOARD_COLORS)[number];
 
+/** Styles of callout. "why" says why the lesson or idea is worth learning. */
+export const CALLOUT_TONES = ['why', 'tip', 'remember', 'example', 'question'] as const;
+export type CalloutTone = (typeof CALLOUT_TONES)[number];
+
 /** Diagram coordinates: a 400 × 240 canvas, origin top-left. */
 export const DIAGRAM_WIDTH = 400;
 export const DIAGRAM_HEIGHT = 240;
@@ -38,7 +42,7 @@ export type BoardBlock =
   | { kind: 'text'; id: string; text: string }
   | { kind: 'math'; id: string; latex: string }
   | { kind: 'list'; id: string; items: string[]; ordered?: boolean }
-  | { kind: 'callout'; id: string; text: string; tone: 'tip' | 'remember' | 'example' | 'question' }
+  | { kind: 'callout'; id: string; text: string; tone: CalloutTone }
   | { kind: 'table'; id: string; headers: string[]; rows: string[][] }
   | { kind: 'number_line'; id: string; min: number; max: number; step?: number; marks?: { value: number; label?: string }[] }
   | {
@@ -69,6 +73,12 @@ export interface BoardUpdate {
 export interface BoardState {
   blocks: BoardBlock[];
   highlight: string | null;
+  /**
+   * A clear arrived with nothing to put in its place. It is carried out when
+   * the next blocks arrive, so the student is never left looking at a blank
+   * board while Ceeq talks.
+   */
+  clearPending?: boolean;
 }
 
 export const EMPTY_BOARD: BoardState = { blocks: [], highlight: null };
@@ -76,8 +86,16 @@ export const EMPTY_BOARD: BoardState = { blocks: [], highlight: null };
 export const MAX_BOARD_BLOCKS = 24;
 
 export function applyBoardUpdate(board: BoardState, update: BoardUpdate): BoardState {
-  let blocks = update.clear ? [] : board.blocks;
-  let highlight = update.clear ? null : board.highlight;
+  const adding = (update.add?.length ?? 0) > 0;
+  const wantsClear = update.clear === true || board.clearPending === true;
+  // Wipe only when there is something to show instead; otherwise remember to.
+  const wipe = wantsClear && adding;
+  const result = applyTo(wipe ? EMPTY_BOARD : { blocks: board.blocks, highlight: board.highlight }, update);
+  return wantsClear && !adding && board.blocks.length > 0 ? { ...result, clearPending: true } : result;
+}
+
+function applyTo(board: BoardState, update: BoardUpdate): BoardState {
+  let { blocks, highlight } = board;
   if (update.remove?.length) {
     const gone = new Set(update.remove);
     blocks = blocks.filter((b) => !gone.has(b.id));
@@ -196,6 +214,7 @@ const KIND_ALIASES: Record<string, Obj> = {
   steps: { kind: 'list', ordered: true },
   definition: { kind: 'callout', tone: 'remember' },
   note: { kind: 'callout', tone: 'remember' },
+  why: { kind: 'callout', tone: 'why' },
   tip: { kind: 'callout', tone: 'tip' },
   example: { kind: 'callout', tone: 'example' },
   question: { kind: 'callout', tone: 'question' },
@@ -238,7 +257,7 @@ function block(raw: unknown, fallbackId: string): BoardBlock | null {
     }
     case 'callout': {
       const text = str(v.text);
-      const tone = (['tip', 'remember', 'example', 'question'] as const).find((t) => t === v.tone) ?? 'tip';
+      const tone = CALLOUT_TONES.find((t) => t === v.tone) ?? 'tip';
       return text ? { kind: 'callout', id, text, tone } : null;
     }
     case 'table': {
@@ -366,7 +385,11 @@ export const WHITEBOARD_TOOL = {
             latex: { type: 'string', description: 'math: a LaTeX formula, e.g. "\\frac{a}{b}" or "\\ce{2H2 + O2 -> 2H2O}".' },
             items: { type: 'array', items: { type: 'string' }, description: 'list items (inline $maths$ allowed).' },
             ordered: { type: 'boolean', description: 'list: numbered steps.' },
-            tone: { type: 'string', enum: ['tip', 'remember', 'example', 'question'], description: 'callout style.' },
+            tone: {
+              type: 'string',
+              enum: [...CALLOUT_TONES],
+              description: 'callout style. "why" is for saying why the lesson or idea matters.',
+            },
             headers: { type: 'array', items: { type: 'string' }, description: 'table column headers (max 6).' },
             rows: { type: 'array', items: { type: 'array', items: { type: 'string' } }, description: 'table rows.' },
             min: { type: 'number', description: 'number_line start.' },

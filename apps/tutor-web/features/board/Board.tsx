@@ -1,17 +1,18 @@
 "use client";
 
 import { useEffect, useRef } from "react";
-import type { BoardBlock, BoardState } from "@codeeaq/shared-types";
+import type { BoardBlock, BoardState, CalloutTone } from "@codeeaq/shared-types";
 import { Diagram, Graph, NumberLine } from "./Figures";
 import { ImageBlock } from "./ImageBlock";
 import { MathBlock, MathText } from "./MathText";
 
-const CALLOUT = {
+const CALLOUT: Record<CalloutTone, { label: string; className: string }> = {
+  why: { label: "Why this matters", className: "border-accent bg-accent-soft" },
   tip: { label: "Tip", className: "border-(--ink-blue) bg-[color-mix(in_oklab,var(--ink-blue)_8%,transparent)]" },
   remember: { label: "Remember", className: "border-(--ink-amber) bg-[color-mix(in_oklab,var(--ink-amber)_10%,transparent)]" },
   example: { label: "Example", className: "border-(--ink-green) bg-[color-mix(in_oklab,var(--ink-green)_8%,transparent)]" },
   question: { label: "Your turn", className: "border-accent bg-accent-soft" },
-} as const;
+};
 
 function Block({ block }: { block: BoardBlock }) {
   switch (block.kind) {

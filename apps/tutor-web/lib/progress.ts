@@ -30,6 +30,7 @@ function parseModule(value: unknown, goalCount: number): ModuleProgress {
     : [];
   return {
     goals,
+    explained: v.explained === true,
     learned: v.learned === true,
     attempts,
     correct: count(v.correct),

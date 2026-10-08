@@ -61,6 +61,19 @@ describe('validateBoardUpdate', () => {
     expect(table).toMatchObject({ rows: [['1', ''], ['2', '3']] });
   });
 
+  it('keeps a "why" callout and falls back to a tip for unknown tones', () => {
+    const { update } = validateBoardUpdate({
+      add: [
+        { kind: 'callout', id: 'w', tone: 'why', text: 'Current is what charges your phone.' },
+        { kind: 'callout', id: 'x', tone: 'shouting', text: 'Hello' },
+      ],
+    });
+    expect(update.add).toEqual([
+      { kind: 'callout', id: 'w', tone: 'why', text: 'Current is what charges your phone.' },
+      { kind: 'callout', id: 'x', tone: 'tip', text: 'Hello' },
+    ]);
+  });
+
   it('accepts common near-miss block names and fields', () => {
     const { update, errors } = validateBoardUpdate({
       add: [
@@ -102,17 +115,36 @@ describe('validateBoardUpdate', () => {
 });
 
 describe('applyBoardUpdate', () => {
-  it('clears, removes, replaces by id and highlights', () => {
-    let board = applyBoardUpdate(EMPTY_BOARD, {
-      add: [
-        { kind: 'text', id: 'a', text: 'one' },
-        { kind: 'text', id: 'b', text: 'two' },
-      ],
-      highlight: 'a',
-    });
-    board = applyBoardUpdate(board, { add: [{ kind: 'text', id: 'b', text: 'TWO' }], remove: ['a'] });
+  const two = applyBoardUpdate(EMPTY_BOARD, {
+    add: [
+      { kind: 'text', id: 'a', text: 'one' },
+      { kind: 'text', id: 'b', text: 'two' },
+    ],
+    highlight: 'a',
+  });
+
+  it('removes, replaces by id and highlights', () => {
+    const board = applyBoardUpdate(two, { add: [{ kind: 'text', id: 'b', text: 'TWO' }], remove: ['a'] });
     expect(board).toEqual({ blocks: [{ kind: 'text', id: 'b', text: 'TWO' }], highlight: null });
-    expect(applyBoardUpdate(board, { clear: true })).toEqual(EMPTY_BOARD);
+  });
+
+  it('clears and writes the new content in one call', () => {
+    const board = applyBoardUpdate(two, { clear: true, add: [{ kind: 'heading', id: 'h', text: 'Recap' }] });
+    expect(board).toEqual({ blocks: [{ kind: 'heading', id: 'h', text: 'Recap' }], highlight: null });
+  });
+
+  it('never leaves the board blank: a clear with nothing to show waits for the next content', () => {
+    const held = applyBoardUpdate(two, { clear: true });
+    expect(held.blocks.map((b) => b.id)).toEqual(['a', 'b']);
+    expect(held.clearPending).toBe(true);
+    // Pointing at something does not use up the pending clear.
+    expect(applyBoardUpdate(held, { highlight: 'b' }).clearPending).toBe(true);
+    const next = applyBoardUpdate(held, { add: [{ kind: 'heading', id: 'h', text: 'Next idea' }] });
+    expect(next).toEqual({ blocks: [{ kind: 'heading', id: 'h', text: 'Next idea' }], highlight: null });
+  });
+
+  it('has nothing to hold back when the board is already empty', () => {
+    expect(applyBoardUpdate(EMPTY_BOARD, { clear: true })).toEqual(EMPTY_BOARD);
   });
 });
 

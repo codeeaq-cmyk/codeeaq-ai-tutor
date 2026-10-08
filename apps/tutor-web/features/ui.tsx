@@ -64,13 +64,15 @@ export function ProgressRing({ value, size = 28 }: { value: number; size?: numbe
   );
 }
 
-export function Icon({ name, className = "h-5 w-5" }: { name: "back" | "mic" | "mic-off" | "send" | "chevron" | "check" | "stop"; className?: string }) {
+export function Icon({ name, className = "h-5 w-5" }: { name: "back" | "mic" | "mic-off" | "send" | "chevron" | "check" | "stop" | "pause" | "play"; className?: string }) {
   const paths: Record<typeof name, ReactNode> = {
     back: <path d="M15 18l-6-6 6-6" />,
     chevron: <path d="M9 18l6-6-6-6" />,
     check: <path d="M20 6L9 17l-5-5" />,
     send: <path d="M5 12h14M13 6l6 6-6 6" />,
     stop: <rect x="6" y="6" width="12" height="12" rx="2" />,
+    pause: <path d="M9 5v14M15 5v14" />,
+    play: <path d="M8 5l11 7-11 7z" />,
     mic: (
       <>
         <rect x="9" y="3" width="6" height="11" rx="3" />

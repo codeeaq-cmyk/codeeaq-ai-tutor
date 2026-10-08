@@ -128,10 +128,19 @@ export interface QuizAttempt {
   at: number;
 }
 
+/**
+ * The two spoken parts of a lesson. While explaining, Ceeq has the floor and
+ * the app prompts her to carry on after each turn. While practising it is a
+ * conversation, and the app waits for the student.
+ */
+export type LessonMode = 'explain' | 'practice';
+
 export interface ModuleProgress {
   /** One status per goal in the module plan. */
   goals: GoalStatus[];
-  /** Ceeq finished teaching the module at least once. */
+  /** Ceeq finished explaining the module at least once, so practice has begun. */
+  explained: boolean;
+  /** Ceeq finished teaching the module (explanation and practice) at least once. */
   learned: boolean;
   attempts: QuizAttempt[];
   /** Answers to Ceeq's spoken check questions. */
@@ -147,7 +156,15 @@ export interface ChapterProgress {
 }
 
 export function emptyModuleProgress(goalCount: number): ModuleProgress {
-  return { goals: Array.from({ length: goalCount }, () => 'todo'), learned: false, attempts: [], correct: 0, incorrect: 0, mistakes: [] };
+  return {
+    goals: Array.from({ length: goalCount }, () => 'todo'),
+    explained: false,
+    learned: false,
+    attempts: [],
+    correct: 0,
+    incorrect: 0,
+    mistakes: [],
+  };
 }
 
 export function bestAttempt(module: ModuleProgress | undefined): QuizAttempt | undefined {
@@ -193,7 +210,7 @@ export interface StartVoiceResponse {
 export const PROGRESS_TOOL = {
   name: 'update_progress',
   description:
-    'Update one goal on the student\'s checklist. "learning" when you start teaching it, "understood" once the student answered a check question correctly on their own, "practice" if they still struggle after re-explaining.',
+    'Update one goal on the student\'s checklist. "learning" when you start explaining it, "understood" once the student answered a practice question correctly on their own, "practice" if they still struggle after re-explaining.',
   parametersJsonSchema: {
     type: 'object',
     properties: {
@@ -220,10 +237,17 @@ export const ANSWER_TOOL = {
   },
 };
 
+export const PRACTICE_TOOL = {
+  name: 'start_practice',
+  description:
+    'Call once, at the start of the turn in which you finish explaining the module and ask the student your first practice question. From then on the app waits for the student after each of your turns instead of prompting you to carry on.',
+  parametersJsonSchema: { type: 'object', properties: {} },
+};
+
 export const FINISH_MODULE_TOOL = {
   name: 'finish_module',
   description:
-    'Call once every goal of the module has been taught and checked. The app then shows the student the module quiz on screen.',
+    'Call once every goal of the module has been explained and practised. The app then shows the student the module quiz on screen.',
   parametersJsonSchema: { type: 'object', properties: {} },
 };
 
