@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatPhone, normalisePhone } from "./phone";
+import { accountName, formatPhone, normalisePhone, phoneOfAccount } from "./phone";
 
 describe("normalisePhone", () => {
   it("takes a ten-digit number as an Indian mobile, however it is typed", () => {
@@ -22,6 +22,31 @@ describe("normalisePhone", () => {
     expect(normalisePhone("98765432101")).toBeNull();
     expect(normalisePhone("+12")).toBeNull();
     expect(normalisePhone("hello")).toBeNull();
+  });
+});
+
+describe("account names", () => {
+  it("writes an Indian number as its ten digits, the way it is typed in the console", () => {
+    expect(accountName("+919876543210")).toBe("9876543210@ceeq.student");
+    expect(phoneOfAccount("9876543210@ceeq.student")).toBe("+919876543210");
+  });
+
+  it("keeps the country code for any other number, so it cannot be taken for an Indian one", () => {
+    // +65 9123 4567 has ten digits in all and starts with 6, like an Indian mobile.
+    expect(accountName("+6591234567")).toBe("006591234567@ceeq.student");
+    expect(phoneOfAccount("006591234567@ceeq.student")).toBe("+6591234567");
+    expect(accountName("+16505551234")).toBe("0016505551234@ceeq.student");
+  });
+
+  it("gives the same account however the student types their number", () => {
+    const typed = ["9876543210", "98765 43210", "098765-43210", "+91 98765 43210", "91 98765 43210"];
+    expect(new Set(typed.map((t) => accountName(normalisePhone(t)!)))).toEqual(new Set(["9876543210@ceeq.student"]));
+  });
+
+  it("reads no number from an account that is not one of ours", () => {
+    expect(phoneOfAccount("someone@example.com")).toBe("");
+    expect(phoneOfAccount("teacher@ceeq.student")).toBe("");
+    expect(phoneOfAccount(null)).toBe("");
   });
 });
 

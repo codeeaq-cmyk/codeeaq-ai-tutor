@@ -1,20 +1,20 @@
 import { useSyncExternalStore } from "react";
-import { onAuthStateChanged, RecaptchaVerifier, signInWithPhoneNumber, signOut, type ConfirmationResult } from "firebase/auth";
-import { auth, AUTH_EMULATOR_URL, PROJECT_ID, USING_EMULATORS } from "./firebase";
+import { createUserWithEmailAndPassword, onAuthStateChanged, signInWithEmailAndPassword, signOut } from "firebase/auth";
+import { auth, USING_EMULATORS } from "./firebase";
+import { accountName, phoneOfAccount } from "./phone";
 import { setStorageStudent } from "./storage";
 import { flushSync, startSync, stopSync } from "./sync";
 
-// Who is signed in. Students sign in with their mobile number and a 6-digit
-// code, through Firebase phone sign-in. There is no separate sign-up: the first
-// time a number is verified, its account is created.
+// Who is signed in. Ceeq is by invitation: a student signs in with their
+// mobile number and a 6-digit code, both set up for them beforehand. Nothing is
+// sent by text, so signing in costs nothing and needs no phone signal.
 //
-// For now Ceeq is by invitation, and no text is ever sent (Firebase bills
-// each one). Each student's number is registered with a fixed code in the
-// Firebase console (Authentication > Sign-in method > Phone > Phone numbers
-// for testing; at most ten), and the student is told that code. The project's
-// SMS region policy allows no region, so any other number is refused instead
-// of being sent a text. Allowing a region there is all it takes to turn texted
-// codes on later.
+// Underneath it is Firebase's sign-in by password, with the number as the
+// account's name (see accountName) and the code as its password. A student is
+// added in the Firebase console under Authentication > Users > Add user. The
+// app never creates accounts itself, and sign-up is switched off for the
+// project (Authentication > Settings > User actions), so only numbers that
+// were added can get in.
 
 export type Account =
   | { status: "loading" }
@@ -42,7 +42,7 @@ function watch() {
       set({ status: "signed-out" });
       return;
     }
-    const signedIn = { status: "signed-in", uid: user.uid, phone: user.phoneNumber ?? "" } as const;
+    const signedIn = { status: "signed-in", uid: user.uid, phone: phoneOfAccount(user.email) } as const;
     // Their storage keys must be in place before anything reads or syncs their data.
     setStorageStudent(user.uid);
     const known = startSync(user.uid, signedIn.phone, () => {
@@ -71,78 +71,51 @@ export function useAccount(): Account {
 
 // ---------- Signing in ----------
 
-let verifier: RecaptchaVerifier | null = null;
-let pending: ConfirmationResult | null = null;
+/** Firebase does not say which of the two was wrong, so that nobody can find out which numbers have accounts. */
+const NO_MATCH = "That number and code don’t match. Check both and try again.";
 
 const MESSAGES: Record<string, string> = {
-  "auth/invalid-phone-number": "That doesn't look like a mobile number. Check it and try again.",
-  "auth/missing-phone-number": "Enter your mobile number.",
-  "auth/too-many-requests": "Too many tries for now. Please wait a few minutes and try again.",
-  "auth/quota-exceeded": "Too many tries for now. Please try again later.",
-  "auth/captcha-check-failed": "The security check didn't pass. Please try again.",
-  "auth/invalid-verification-code": "That code isn't right. Check it and try again.",
-  "auth/missing-verification-code": "Enter your 6-digit code.",
-  "auth/code-expired": "That took too long. Go back and enter your number again.",
-  "auth/session-expired": "That took too long. Go back and enter your number again.",
+  "auth/invalid-credential": NO_MATCH,
+  "auth/invalid-login-credentials": NO_MATCH,
+  "auth/user-not-found": NO_MATCH,
+  "auth/wrong-password": NO_MATCH,
+  "auth/invalid-email": NO_MATCH,
+  "auth/missing-password": "Enter your 6-digit code.",
+  "auth/too-many-requests": "Too many wrong tries. Please wait a few minutes and try again.",
   "auth/network-request-failed": "No connection. Check your internet and try again.",
-  "auth/user-disabled": "This number has been blocked. Please contact support.",
-  // What a number gets when it has no registered code and texts are not allowed.
-  "auth/operation-not-allowed": "This number isn't registered for Ceeq yet.",
-  "auth/billing-not-enabled": "This number isn't registered for Ceeq yet.",
+  "auth/user-disabled": "This number has been switched off. Ask the person who invited you.",
+  "auth/operation-not-allowed": "Signing in isn’t switched on yet.",
 };
 
-function explain(err: unknown): Error {
+const codeOf = (err: unknown) => {
   const code = (err as { code?: unknown } | null)?.code;
-  console.warn("Sign-in failed:", err);
-  return new Error((typeof code === "string" && MESSAGES[code]) || "Something went wrong. Please try again.");
-}
+  return typeof code === "string" ? code : "";
+};
 
-/**
- * Starts signing in with a number (in international form); `confirmCode`
- * finishes it. A registered number is sent nothing, since the student already
- * has its code. `slot` is an element on the page that holds the invisible
- * security check which guards against bots.
- */
-export async function startSignIn(phone: string, slot: HTMLElement): Promise<void> {
-  verifier?.clear();
-  // The check cannot be drawn twice in one element, so each try gets a fresh one.
-  const holder = document.createElement("div");
-  slot.replaceChildren(holder);
-  verifier = new RecaptchaVerifier(auth, holder, { size: "invisible" });
+/** Signs a student in with their number (in international form) and their code. */
+export async function signInWithCode(phone: string, code: string): Promise<void> {
+  const name = accountName(phone);
   try {
-    pending = await signInWithPhoneNumber(auth, phone, verifier);
+    await signInWithEmailAndPassword(auth, name, code);
   } catch (err) {
-    throw explain(err);
+    // Local development has nobody to add students, so a number's first code becomes its code.
+    if (USING_EMULATORS && (await createdLocally(name, code))) return;
+    console.warn("Sign-in failed:", err);
+    throw new Error(MESSAGES[codeOf(err)] ?? "Something went wrong. Please try again.");
   }
 }
 
-/** Signs the student in with their code. */
-export async function confirmCode(code: string): Promise<void> {
-  if (!pending) throw new Error("Enter your number first.");
+/** Emulator only: makes the account if the number has none yet. False if it has one, so the code was simply wrong. */
+async function createdLocally(name: string, code: string): Promise<boolean> {
   try {
-    await pending.confirm(code);
-    pending = null;
-  } catch (err) {
-    throw explain(err);
+    await createUserWithEmailAndPassword(auth, name, code);
+    return true;
+  } catch {
+    return false;
   }
 }
 
 export async function signOutStudent(): Promise<void> {
   await flushSync();
   await signOut(auth);
-}
-
-/**
- * Local development only: the emulator accepts any number and makes up its
- * code. Returns the latest code for the number so the sign-in page can show it.
- */
-export async function localTestCode(phone: string): Promise<string | undefined> {
-  if (!USING_EMULATORS) return undefined;
-  try {
-    const response = await fetch(`${AUTH_EMULATOR_URL}/emulator/v1/projects/${PROJECT_ID}/verificationCodes`);
-    const { verificationCodes } = (await response.json()) as { verificationCodes?: { phoneNumber: string; code: string }[] };
-    return verificationCodes?.filter((v) => v.phoneNumber === phone).at(-1)?.code;
-  } catch {
-    return undefined;
-  }
 }

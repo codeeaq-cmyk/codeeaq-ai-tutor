@@ -13,17 +13,22 @@ npm run dev:web          # Next.js app on http://localhost:3000
 
 The project ID `demo-ceeq` (`.firebaserc`) is emulator-only, so no Firebase account is needed to develop. While editing functions, run `npm run watch:functions` alongside the emulators so they reload. For deployed functions, set the key with `npx firebase functions:secrets:set GEMINI_API_KEY`. Models and voice can be overridden in `apps/tutor-functions/.env` (see `.env.example`).
 
-Signing in locally works with any mobile number: the emulator makes up a code and the sign-in page shows it. Accounts and progress in the emulators last until they are stopped. If the machine's default Java is older than 21, `dev:backend` uses a newer one it finds (Android Studio ships one) for that run only; set `CEEQ_JAVA_HOME` to choose one.
+Signing in locally works with any mobile number: the first code used with a number becomes its code. Accounts and progress in the emulators last until they are stopped. If the machine's default Java is older than 21, `dev:backend` uses a newer one it finds (Android Studio ships one) for that run only; set `CEEQ_JAVA_HOME` to choose one.
 
 Other scripts: `npm test` (all three workspaces), `npm run build`.
 
-Going live also needs, once per Firebase project: Authentication with the Phone provider switched on and the site's domain added to its authorised domains; a Firestore database (`asia-south1`); and `npx firebase deploy --only firestore:rules,functions --project prod`.
+Going live also needs, once per Firebase project: Authentication with the Email/Password provider switched on and sign-up switched off (Authentication > Settings > User actions > untick "Enable create"); a Firestore database (`asia-south1`); and `npx firebase deploy --only firestore:rules,functions --project prod`. The Phone provider is not used and should stay off, so that no text can ever be sent or billed.
 
-Sign-in is by invitation for now, so that no text is sent (Firebase bills each one, $0.07 to India). Each student is added in the Firebase console under Authentication > Sign-in method > Phone > Phone numbers for testing, as their number and a 6-digit code of your choosing, and is told that code. Firebase allows ten such numbers. The SMS region policy (Authentication > Settings) must allow no region, which is the default for a new project: any other number is then refused instead of being texted. To turn texted codes on later, allow India there and bring back a "send again" link on the sign-in page.
+Sign-in is by invitation, with a mobile number and a 6-digit code that the student is given; nothing is sent by text. To add a student, open the Firebase console at Authentication > Users > Add user and enter:
+
+- **Email:** the student's ten-digit mobile number followed by `@ceeq.student`, for example `9876543210@ceeq.student`. It is only the account's name; no email is sent to it. For a number outside India, write `00`, the country code and the number instead, for example `0016505551234@ceeq.student`.
+- **Password:** the 6-digit code to give the student.
+
+The same page changes a student's code (reset password), switches a student off (disable account) and removes one. Earlier, Firebase's phone sign-in was tried with numbers registered as test numbers: it allows only ten, and blocking texts to a country blocks that country's test numbers too.
 
 | Path | Contents |
 |---|---|
-| `apps/tutor-web` | Next.js app: phone sign-in, setup (board, class, stream, language), syllabus with revision reminders, chapter page with modules, live lesson and revision lesson with whiteboard, quizzes |
+| `apps/tutor-web` | Next.js app: sign-in by number and code, setup (board, class, stream, language), syllabus with revision reminders, chapter page with modules, live lesson and revision lesson with whiteboard, quizzes |
 | `apps/tutor-functions` | Cloud Functions `getSyllabus`, `getChapterPlan` (chapter → modules), `getQuiz` (module quiz) and `createVoiceSession` (locked Gemini Live token for a module's lesson or revision). All require a signed-in student |
 | `packages/shared-types` | Profile, syllabus, chapter plan, quiz and progress types; weak spots and revision; whiteboard blocks and validator; lesson tools |
 | `firestore.rules` | Each student can read and write only their own record and progress |
@@ -31,7 +36,7 @@ Sign-in is by invitation for now, so that no text is sent (Firebase bills each o
 
 ### How it works
 
-1. **Sign-in.** A student signs in with their mobile number and the 6-digit code registered with it (Firebase phone sign-in, `apps/tutor-web/lib/account.ts`). For now the code is given to them rather than texted; see above. There is no separate sign-up: the first time a number is verified, its account is created. Every page and every Cloud Function requires a signed-in student.
+1. **Sign-in.** A student signs in with their mobile number and the 6-digit code they were given (`apps/tutor-web/lib/account.ts`). Underneath it is Firebase's sign-in by password, with the number as the account's name and the code as its password; students are added in the Firebase console, as described above, and the app never creates accounts. Every page and every Cloud Function requires a signed-in student.
 2. **Setup.** The student picks board, class, stream (11–12) and the language Ceeq speaks. Stored with their account.
 3. **Syllabus.** `getSyllabus` returns every subject and chapter. Curated syllabi (`apps/tutor-functions/src/syllabus/curated.ts`, currently CBSE Class 10) load instantly. Any other board and class is compiled by Gemini, cached on the server and on the device. The student can also type any subject and chapter.
 4. **Modules.** Opening a chapter calls `getChapterPlan`, which splits it into 3–6 modules, each with a few learning goals. The plan is stored with the chapter's progress, so later visits are instant. If planning fails, the chapter is offered as a single lesson.
