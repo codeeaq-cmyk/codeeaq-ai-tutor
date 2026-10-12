@@ -39,13 +39,25 @@ import { useChapterTarget, type ChapterRouteProps, type ChapterTarget } from "@/
 import {
   CARRY_ON,
   carryOnLimit,
+  carryOverNote,
   Evidence,
   GAP_AFTER_STUDENT_MS,
+  GO_ON,
   goalInHand,
+  HOLD_STEP_MS,
   LEAD_MS,
+  MAX_HOLD_MS,
+  MAX_RECONNECTS,
+  MAX_SILENT_TURNS,
   openingFor,
+  QUIZ_SHOWN,
+  quizReport,
+  quizResultPrompt,
+  REVISION_OVER,
   revisionOpening,
   SILENCE_MS,
+  SPEAK_UP,
+  type Stage,
   startingMode,
   WRAP_UP,
 } from "./lessonFlow";
@@ -127,6 +139,8 @@ function ModuleLesson({ target, plan, index, provisional, startWithQuiz, topics 
   const [board, setBoard] = useState<BoardState>(EMPTY_BOARD);
   const [view, setViewState] = useState<View>(startWithQuiz ? "quiz" : "lesson");
   const [text, setText] = useState("");
+  /** The student has finished the quiz in this sitting. */
+  const [quizTaken, setQuizTaken] = useState(false);
   const [outcomes, setOutcomes] = useState<Record<number, Outcome>>({});
   /** The time by which "due" is judged; moved on when the student does something that adds to the list. */
   const [clock, setClock] = useState(() => Date.now());
@@ -141,8 +155,20 @@ function ModuleLesson({ target, plan, index, provisional, startWithQuiz, topics 
     paused: false,
     view: (startWithQuiz ? "quiz" : "lesson") as View,
     prompts: 0,
+    /** Turns in a row in which Ceeq said nothing. */
+    silences: 0,
+    /** How often the connection has been replaced since Ceeq last managed a turn. */
+    reconnects: 0,
     /** Goals Ceeq has finished with in this sitting: understood, or left for another day. */
     settled: new Set<number>(),
+    /** How long the prompt now due has been held back because the mic hears a voice. */
+    held: 0,
+    /** The mic hears voice-loud sound that the service does not take for speech: prompts are no longer held back for it. */
+    noisy: false,
+    /** How the student did in the quiz, once they have finished it in this sitting. */
+    quizReport: null as string | null,
+    /** Ceeq has been told the quiz result and has not yet said anything to it. */
+    resultDue: false,
   });
   // What the student has said in this sitting, which Ceeq's judgements must rest on.
   const evidence = useRef(new Evidence());
@@ -219,6 +245,8 @@ function ModuleLesson({ target, plan, index, provisional, startWithQuiz, topics 
         case "record_answer": {
           const answer = parseAnswer(args, mod.goals.length);
           if (!answer) return { ok: false, error: "correct must be true or false" };
+          // While she explains she asks nothing, so a question the student puts to her then is not a wrong answer.
+          if (flow.current.mode === "explain") return { ok: true };
           // Only what the student actually said can be right or wrong.
           if (!evidence.current.allowAnswer()) return { ok: true };
           // She works through the goals in order, so an answer with no goal is about the one in hand.
@@ -253,6 +281,8 @@ function ModuleLesson({ target, plan, index, provisional, startWithQuiz, topics 
           if (flow.current.mode !== "practice" || !evidence.current.practised) {
             return { ok: true, note: "The student has not practised yet, so the quiz is not shown. Ask a practice question and wait for their answer." };
           }
+          // Connected afresh after the quiz, she may call this again: there is nothing more to show.
+          if (flow.current.view === "quiz" && flow.current.quizReport) return { ok: true };
           // Ceeq sometimes forgets to tick a goal off; finishing means they were all covered.
           updateModule(target.key, mod.id, (m) => ({
             ...m,
@@ -292,12 +322,24 @@ function ModuleLesson({ target, plan, index, provisional, startWithQuiz, topics 
     carryOnTimer.current = null;
   }, []);
 
+  // It puts itself off for a moment while the student is talking, so it is also kept in a ref.
+  const carryOnRef = useRef<() => void>(() => {});
   const carryOn = useCallback(() => {
     carryOnTimer.current = null;
     const voiceNow = voiceRef.current;
     const { mode: modeNow, paused: pausedNow, view: viewNow } = flow.current;
     // Never cut her off: if a turn is still arriving, its end will bring us back here.
     if (!voiceNow || modeNow !== "explain" || pausedNow || viewNow !== "lesson" || voiceNow.isMidTurn()) return;
+    // Nor talk over the student. If the service takes what the mic hears for speech,
+    // Ceeq answers it, and the end of her answer brings us back here.
+    if (voiceNow.isHearingVoice() && !flow.current.noisy && flow.current.held < MAX_HOLD_MS) {
+      flow.current.held += HOLD_STEP_MS;
+      carryOnTimer.current = setTimeout(() => carryOnRef.current(), HOLD_STEP_MS);
+      return;
+    }
+    // Held back to the limit, and nobody was heard to speak: it is the room that is loud.
+    if (flow.current.held >= MAX_HOLD_MS) flow.current.noisy = true;
+    flow.current.held = 0;
     const prompts = ++flow.current.prompts;
     const limit = carryOnLimit(mod.goals.length);
     if (prompts > limit + 1) {
@@ -307,11 +349,54 @@ function ModuleLesson({ target, plan, index, provisional, startWithQuiz, topics 
     }
     voiceNow.notify(prompts > limit ? WRAP_UP : CARRY_ON);
   }, [mod.goals.length, setMode]);
+  useEffect(() => {
+    carryOnRef.current = carryOn;
+  }, [carryOn]);
+
+  /**
+   * Carries the lesson over to a new connection, where Ceeq is told where it
+   * stands and what she last said. False if that could not be started.
+   */
+  const carryOver = useCallback(
+    (voiceNow: ReturnType<typeof useCeeqVoice>) => {
+      const saved = readChapterProgress(target.key)?.modules[mod.id];
+      const lastWords = voiceNow.lastWords();
+      const revised = topics ? topics.filter((t) => flow.current.settled.has(t.index)).map((t) => t.index + 1) : null;
+      const { mode: modeNow, view: viewNow, quizReport: report, resultDue } = flow.current;
+      const stage: Stage = viewNow === "quiz" ? { at: "quiz", report } : revised ? { at: "revision", revised, over: viewNow === "done" } : { at: modeNow };
+      // What is asked of her if she was due to speak when the old connection was lost.
+      let prompt: string;
+      if (viewNow === "quiz") prompt = !report ? QUIZ_SHOWN : resultDue ? quizResultPrompt(report) : GO_ON;
+      else if (viewNow === "done") prompt = REVISION_OVER;
+      // If she had not spoken yet, it is the opening she never gave.
+      else if (!lastWords) prompt = revised ? revisionOpening(revised) : openingFor(mod, saved);
+      else prompt = modeNow === "explain" ? CARRY_ON : GO_ON;
+      return voiceNow.reconnect({ note: carryOverNote(mod, saved, stage, !!lastWords), lastWords, prompt });
+    },
+    [mod, target.key, topics],
+  );
 
   const onTurnEnd = useCallback(
-    ({ afterStudent, remainingMs }: { afterStudent: boolean; remainingMs: number }) => {
+    ({ afterStudent, remainingMs, silent }: { afterStudent: boolean; remainingMs: number; silent: boolean }) => {
       cancelCarryOn();
-      if (flow.current.mode !== "explain" || flow.current.paused || flow.current.view !== "lesson") return;
+      flow.current.silences = silent ? flow.current.silences + 1 : 0;
+      const { quizReport: report, resultDue } = flow.current;
+      if (!silent) {
+        flow.current.reconnects = 0;
+        // Whatever she said after being told the quiz result was her word on it.
+        flow.current.resultDue = false;
+      }
+      if (flow.current.paused) return;
+      if (flow.current.view !== "lesson") {
+        // Outside the lesson itself one thing is wanted of her, a word on how the quiz went, and she has said nothing.
+        if (silent && resultDue && report && flow.current.silences <= MAX_SILENT_TURNS) voiceRef.current?.notify(quizResultPrompt(report));
+        return;
+      }
+      if (flow.current.mode !== "explain") {
+        // In conversation the student is waiting on her: a turn in which she said nothing must not be left at that.
+        if (silent && flow.current.silences <= MAX_SILENT_TURNS) voiceRef.current?.notify(SPEAK_UP);
+        return;
+      }
       // After she has answered the student, let it all play out and leave room
       // for a follow-up. Otherwise prompt just before the paragraph ends.
       const wait = afterStudent ? remainingMs + GAP_AFTER_STUDENT_MS : Math.max(0, remainingMs - LEAD_MS);
@@ -325,30 +410,11 @@ function ModuleLesson({ target, plan, index, provisional, startWithQuiz, topics 
   const onStudentInput = useCallback(() => {
     evidence.current.studentSpoke();
     cancelCarryOn();
+    flow.current.held = 0;
     if (!flow.current.paused) return;
     setPaused(false);
     voiceRef.current?.releasePlayback();
   }, [cancelCarryOn, setPaused]);
-
-  const voice = useCeeqVoice({ getToken, onToolCall, speed: pace.speed, onTurnEnd, onStudentInput });
-  useEffect(() => {
-    voiceRef.current = voice;
-  });
-  const live = voice.status === "live";
-  const busy = voice.status === "connecting";
-
-  // A safety net: if she should be explaining and nothing at all is happening
-  // (a prompt was lost, or background noise was taken for speech), prompt her.
-  const quiet = voice.activity === "idle" || voice.activity === "thinking";
-  useEffect(() => {
-    if (!live || mode !== "explain" || paused || view !== "lesson" || !quiet) return;
-    const timer = setTimeout(() => {
-      if (!carryOnTimer.current) carryOn();
-    }, SILENCE_MS);
-    return () => clearTimeout(timer);
-  }, [live, mode, paused, view, quiet, carryOn]);
-
-  useEffect(() => cancelCarryOn, [cancelCarryOn]);
 
   /** Connects and begins the lesson in the part the student has reached, or the revision. */
   const begin = useCallback(
@@ -357,12 +423,19 @@ function ModuleLesson({ target, plan, index, provisional, startWithQuiz, topics 
       const settled = flow.current.settled;
       cancelCarryOn();
       flow.current.prompts = 0;
+      flow.current.silences = 0;
+      flow.current.reconnects = 0;
+      flow.current.held = 0;
+      flow.current.noisy = false;
+      flow.current.quizReport = null;
+      flow.current.resultDue = false;
+      setQuizTaken(false);
       // A new connection is a new conversation: nothing has been said in it yet.
       evidence.current = new Evidence();
       setPaused(false);
       setView("lesson");
       if (topics) {
-        // Reconnecting after a dropped line carries on down the list; a finished revision starts afresh.
+        // Starting again after a pause carries on down the list; a finished revision starts afresh.
         if (topics.every((t) => settled.has(t.index))) {
           settled.clear();
           setOutcomes({});
@@ -382,8 +455,65 @@ function ModuleLesson({ target, plan, index, provisional, startWithQuiz, topics 
       setMode(startIn);
       void voiceNow.connect(openingFor(mod, saved));
     },
-    [cancelCarryOn, mod, topics, setMode, setPaused, setView, target.key],
+    [cancelCarryOn, mod, topics, setMode, setPaused, setQuizTaken, setView, target.key],
   );
+
+  // Ceeq cannot be heard from, or soon will not be. If she has simply said
+  // nothing when she was due to, asking again, in the way that fits the part,
+  // is enough. If she stopped after a tool call or part-way through speaking,
+  // if she stays silent when asked again, or if the connection has ended or is
+  // about to, the lesson is carried over to a new one.
+  const onSilence = useCallback(
+    (why: "no-reply" | "stuck" | "closing" | "closed", attempt: number) => {
+      const voiceNow = voiceRef.current;
+      if (!voiceNow) return false;
+      if (why === "no-reply") {
+        // While paused nothing is expected of her, and during the quiz she has been told to keep quiet until she hears the result.
+        const { quizReport: report, resultDue } = flow.current;
+        if (flow.current.paused || (flow.current.view === "quiz" && !resultDue)) return true;
+        if (attempt === 1) {
+          if (flow.current.view === "quiz" && report) voiceNow.notify(quizResultPrompt(report));
+          else if (flow.current.mode !== "explain") voiceNow.notify(SPEAK_UP);
+          else if (!carryOnTimer.current) carryOn();
+          return true;
+        }
+      }
+      // A connection replaced on notice is no failure. One that was lost counts towards the limit.
+      if (why !== "closing") {
+        if (flow.current.reconnects >= MAX_RECONNECTS) return false;
+        flow.current.reconnects++;
+      }
+      return carryOver(voiceNow);
+    },
+    [carryOn, carryOver],
+  );
+
+  const voice = useCeeqVoice({ getToken, onToolCall, speed: pace.speed, onTurnEnd, onStudentInput, onSilence });
+  useEffect(() => {
+    voiceRef.current = voice;
+  });
+  const live = voice.status === "live";
+  const busy = voice.status === "connecting";
+
+  // The quiz is taken in silence. Until it is finished Ceeq does not listen, so that
+  // nothing said over it, by the student or anyone else in the room, is taken for an
+  // answer, and she is not tempted to announce a result nobody has given her.
+  const { setHearing } = voice;
+  const listening = view !== "quiz" || quizTaken;
+  useEffect(() => setHearing(listening), [listening, setHearing]);
+
+  // A safety net: if she should be explaining and nothing at all is happening
+  // (a prompt was lost, or background noise was taken for speech), prompt her.
+  const quiet = voice.activity === "idle" || voice.activity === "thinking";
+  useEffect(() => {
+    if (!live || mode !== "explain" || paused || view !== "lesson" || !quiet) return;
+    const timer = setTimeout(() => {
+      if (!carryOnTimer.current) carryOn();
+    }, SILENCE_MS);
+    return () => clearTimeout(timer);
+  }, [live, mode, paused, view, quiet, carryOn]);
+
+  useEffect(() => cancelCarryOn, [cancelCarryOn]);
 
   const start = useCallback(() => begin(voice), [begin, voice]);
 
@@ -442,8 +572,11 @@ function ModuleLesson({ target, plan, index, provisional, startWithQuiz, topics 
         ),
       );
       setClock(now);
-      const missed = result.missed.length ? `Questions they missed: ${result.missed.map((q) => `"${q}"`).join("; ")}.` : "They missed nothing.";
-      voice.notify(`(Quiz result: ${result.score} out of ${result.total}. ${missed} Respond as instructed for a quiz result.)`);
+      const report = quizReport(result.score, result.total, result.missed);
+      flow.current.quizReport = report;
+      setQuizTaken(true);
+      // False when the lesson is not running: then there is nobody to tell.
+      flow.current.resultDue = voice.notify(quizResultPrompt(report));
     },
     [target.key, mod.id, voice],
   );
@@ -539,6 +672,7 @@ function ModuleLesson({ target, plan, index, provisional, startWithQuiz, topics 
               moduleTitle={mod.title}
               load={loadQuestions}
               onFinished={onQuizFinished}
+              onActivity={voice.stillHere}
               // From a revision, "revisit the lesson" means the whole lesson, which is another page.
               onRevisitLesson={revising ? () => router.push(target.href(mod.id)) : live ? () => setView("lesson") : start}
               next={next}
@@ -619,7 +753,7 @@ function ModuleLesson({ target, plan, index, provisional, startWithQuiz, topics 
               <input
                 value={text}
                 onChange={(e) => setText(e.target.value)}
-                placeholder={voice.heard || (explaining ? "Ask a question any time" : voice.micOn ? "Just talk, or type here" : "Type your answer")}
+                placeholder={voice.heard || (explaining ? "Ask a question any time" : view === "quiz" ? "Message Ceeq" : voice.micOn ? "Just talk, or type here" : "Type your answer")}
                 className="plain-focus min-w-0 flex-1 bg-transparent py-2.5 placeholder:text-muted"
                 maxLength={500}
               />

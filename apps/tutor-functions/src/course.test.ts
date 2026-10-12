@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { Ask } from './ai';
-import { buildPlanPrompt, buildQuizPrompt, generateChapterPlan, parsePlanReply, parseQuizReply } from './course';
+import { buildPlanPrompt, buildQuizPrompt, generateChapterPlan, generateQuiz, parsePlanReply, parseQuizReply } from './course';
 
 const ref = { profile: { board: 'cbse', classLevel: 10, language: 'en' }, subject: 'Science', chapter: 'Electricity' } as const;
 const module = { title: "Ohm's law", goals: ['State the law'] };
@@ -32,6 +32,12 @@ describe('chapter plan', () => {
     await Promise.all([generateChapterPlan(ask as unknown as Ask, other), generateChapterPlan(ask as unknown as Ask, other)]);
     expect(ask).toHaveBeenCalledOnce();
   });
+
+  it('holds the model to the shape of a plan', async () => {
+    const ask = vi.fn(async () => ({ modules: [] }));
+    await generateChapterPlan(ask as unknown as Ask, { ...ref, chapter: 'Sound' });
+    expect(ask).toHaveBeenCalledWith(expect.any(String), parsePlanReply, expect.objectContaining({ required: ['modules'] }));
+  });
 });
 
 describe('quiz', () => {
@@ -47,6 +53,12 @@ describe('quiz', () => {
     const bad = [question(1, { options: ['a', 'b', 'c'] }), question(2, { answer: 7 }), question(3, { options: ['a', 'a', 'b', 'c'] })];
     expect(() => parseQuizReply(JSON.stringify({ questions: [...bad, question(4), question(5)] }))).toThrow('too few');
     expect(parseQuizReply(JSON.stringify({ questions: [...bad, question(4), question(5), question(6)] }))).toHaveLength(3);
+  });
+
+  it('holds the model to the shape of a quiz', async () => {
+    const ask = vi.fn(async () => []);
+    await generateQuiz(ask as unknown as Ask, { ...ref, module });
+    expect(ask).toHaveBeenCalledWith(expect.any(String), parseQuizReply, expect.objectContaining({ required: ['questions'] }));
   });
 
   it('caps the quiz at five questions', () => {

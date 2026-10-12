@@ -149,7 +149,7 @@ DRAW ONLY WHAT IS ABSTRACT:
 
 REAL EXAMPLES ALWAYS: Tie every idea to something from the student's own life in India before its definition: the kitchen, the bus, cricket, the monsoon, a mobile phone, the market, a festival. Where a picture of that example would help, show it with an image block too.`;
 
-  const lessonEnd = `PART 3, QUIZ: When every goal has been practised, begin a turn by calling finish_module, then say in one sentence that a short quiz comes next. The app shows the quiz on screen: stay silent while the student takes it. When you are told the result, respond in two or three sentences: celebrate what went well and give one short tip for anything missed. Do not start teaching another module.
+  const lessonEnd = `PART 3, QUIZ: When every goal has been practised, begin a turn by calling finish_module, then say in one sentence that a short quiz comes next. The app shows the quiz on screen: stay silent while the student takes it, whatever you hear. You know how it went only when a message beginning "(Quiz result:" tells you: never guess a score or make one up. When you are told the result, respond in two or three sentences: celebrate what went well and give one short tip for anything missed. Do not start teaching another module.
 
 REVISITS: The student may repeat a module as often as they like. If told they are revisiting, never treat it as a failure. Explain it again, more briefly, then practise and finish as usual.`;
 
@@ -218,6 +218,9 @@ export function toolsFor({ revise }: StartVoiceRequest) {
     : [WHITEBOARD_TOOL, PRACTICE_TOOL, PROGRESS_TOOL, ANSWER_TOOL, FINISH_MODULE_TOOL];
 }
 
+/** How often minting a token is tried, and how long to wait before each further try. */
+const MINT_WAITS_MS = [0, 400, 1200];
+
 export async function mintVoiceToken(
   apiKey: string,
   model: string,
@@ -226,11 +229,41 @@ export async function mintVoiceToken(
 ): Promise<string> {
   // Ephemeral tokens with locked config are v1alpha-only.
   const ai = new GoogleGenAI({ apiKey, httpOptions: { apiVersion: 'v1alpha' } });
+  // The service now and then answers "unavailable" for a moment; a student should not be turned away for that.
+  let failure: unknown;
+  for (const wait of MINT_WAITS_MS) {
+    if (wait) await new Promise((resolve) => setTimeout(resolve, wait));
+    try {
+      return await mintOnce(ai, model, voiceName, request);
+    } catch (err) {
+      failure = err;
+    }
+  }
+  throw failure;
+}
+
+/**
+ * How long after it is minted a token can still open its session. The browser
+ * fetches a token when the lesson page opens, and the student may read for a
+ * while before starting. (The service's own default is one minute.)
+ */
+export const TOKEN_OPENS_FOR_MS = 10 * 60 * 1000;
+/**
+ * How long after it is minted a token's session can go on: after this the
+ * service refuses its messages. A connection lasts about ten minutes, and the
+ * browser carries a lesson over to a new one with a new token, so this only
+ * has to cover the wait before starting and one connection.
+ */
+const SESSION_LASTS_MS = 30 * 60 * 1000;
+
+async function mintOnce(ai: GoogleGenAI, model: string, voiceName: string, request: StartVoiceRequest): Promise<string> {
+  const now = Date.now();
   const token = await ai.authTokens.create({
     config: {
+      // One connection: a second one, even to resume the same session, is refused.
       uses: 1,
-      // Time allowed to open the connection; the session itself is not cut off.
-      expireTime: new Date(Date.now() + 10 * 60 * 1000).toISOString(),
+      newSessionExpireTime: new Date(now + TOKEN_OPENS_FOR_MS).toISOString(),
+      expireTime: new Date(now + SESSION_LASTS_MS).toISOString(),
       liveConnectConstraints: {
         model,
         config: {

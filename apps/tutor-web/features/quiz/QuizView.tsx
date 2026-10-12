@@ -20,6 +20,8 @@ interface Props {
   /** Loads the quiz; `fresh` asks for questions the student hasn't seen. */
   load: (fresh: boolean) => Promise<QuizQuestion[]>;
   onFinished: (result: QuizResult) => void;
+  /** The student answered a question or moved on to the next: they are still here. */
+  onActivity?: () => void;
   onRevisitLesson: () => void;
   /** Where to go next after the quiz: the next module, or back to the chapter. */
   next: { href: string; label: string };
@@ -35,14 +37,16 @@ type Phase =
 
 const LETTERS = ["A", "B", "C", "D"];
 
-export function QuizView({ moduleTitle, load, onFinished, onRevisitLesson, next, revise }: Props) {
+export function QuizView({ moduleTitle, load, onFinished, onActivity, onRevisitLesson, next, revise }: Props) {
   const [phase, setPhase] = useState<Phase>({ name: "loading" });
   const loadRef = useRef(load);
   const finishedRef = useRef(onFinished);
+  const activityRef = useRef(onActivity);
   useEffect(() => {
     loadRef.current = load;
     finishedRef.current = onFinished;
-  }, [load, onFinished]);
+    activityRef.current = onActivity;
+  }, [load, onFinished, onActivity]);
 
   const fetchQuestions = useCallback((fresh: boolean) => {
     loadRef
@@ -69,11 +73,13 @@ export function QuizView({ moduleTitle, load, onFinished, onRevisitLesson, next,
   const answered = asking ? asking.picks[asking.index] !== undefined : false;
 
   const pick = useCallback((option: number) => {
+    activityRef.current?.();
     setPhase((p) => (p.name === "asking" && p.picks[p.index] === undefined ? { ...p, picks: [...p.picks, option] } : p));
   }, []);
 
   const advance = useCallback(() => {
     if (phase.name !== "asking" || phase.picks[phase.index] === undefined) return;
+    activityRef.current?.();
     const { questions, picks, index } = phase;
     if (index + 1 < questions.length) {
       setPhase({ ...phase, index: index + 1 });

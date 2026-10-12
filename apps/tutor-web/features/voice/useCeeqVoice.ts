@@ -12,8 +12,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { GoogleGenAI, type LiveServerMessage, type Session } from "@google/genai";
 import type { StartVoiceResponse } from "@codeeaq/shared-types";
-import { SecondTake, type Released } from "./secondTake";
 import { TimeStretcher } from "./timeStretch";
+import { endsSentence, pauseNear, TurnSpeech, type Cut } from "./turnSpeech";
 
 export type VoiceStatus = "idle" | "connecting" | "live" | "paused" | "error";
 export type VoiceActivity = "idle" | "listening" | "thinking" | "speaking";
@@ -26,58 +26,164 @@ interface Options {
   /** How fast Ceeq's voice plays: 1 is as the model speaks, 0.85 is 15% slower. */
   speed: number;
   /**
-   * Ceeq has finished producing a turn. `remainingMs` is how much of it the
-   * student has yet to hear (slowed speech plays for longer than it takes to
-   * arrive). `afterStudent` is true when the turn answered something the
-   * student said or typed.
+   * Ceeq's speech for a turn has all arrived. `remainingMs` is how much of it
+   * the student has yet to hear (speech arrives several times faster than it
+   * is spoken). `afterStudent` is true when the turn answered something the
+   * student said or typed. `silent` is true when she said nothing at all.
    */
-  onTurnEnd?: (info: { afterStudent: boolean; remainingMs: number }) => void;
-  /** The student started speaking or sent a typed message. */
+  onTurnEnd?: (info: { afterStudent: boolean; remainingMs: number; silent: boolean }) => void;
+  /** The student started speaking (cutting in on Ceeq, or heard to say something) or sent a typed message. */
   onStudentInput?: () => void;
+  /**
+   * Ceeq cannot be heard from. "no-reply": she was due to speak and nothing
+   * has come since she was prompted; `attempt` counts how often this has now
+   * been reported in a row. "stuck": she called a tool, was answered, and then
+   * stopped, or stopped part-way through what she was saying, after which the
+   * service ignores prompts on this connection.
+   * "closing": the service has given notice that the connection will end (it
+   * does after about ten minutes, with under a minute's notice), and this is a
+   * quiet moment to replace it. "closed": the connection has ended.
+   * Return true if something was done about it; otherwise the lesson is
+   * paused (or, for "closing", left to run until the connection ends).
+   */
+  onSilence?: (why: "no-reply" | "stuck" | "closing" | "closed", attempt: number) => boolean;
+}
+
+/** What a new connection is told so that the lesson can carry on over it. Ceeq remembers nothing of the old one. */
+export interface CarryOver {
+  /** Where the lesson stands. */
+  note: string;
+  /** The last thing she said to the student, or "" if she had said nothing yet. */
+  lastWords: string;
+  /** What to ask of her if she was due to speak when the old connection was lost. */
+  prompt: string;
 }
 
 const MIC_SAMPLE_RATE = 16000; // must match public/audio-processor.js
+const MIC_FORMAT = `audio/pcm;rate=${MIC_SAMPLE_RATE}`;
+/**
+ * The service ends a connection that has sent it no sound for about five
+ * minutes. While the mic is not feeding it (muted, blocked, or switched off
+ * for a quiz), this much silence is sent, this often, in its place.
+ */
+const HUSH_MS = 250;
+/** How long a connection may take to open before it is given up and another is tried. */
+const CONNECT_TIMEOUT_MS = 8000;
+/** How many times opening a connection is tried before the student is told it failed. */
+const CONNECT_TRIES = 3;
 const PLAYBACK_SAMPLE_RATE = 24000; // Gemini Live's output audio rate
-const TOKEN_TTL_MS = 8 * 60 * 1000; // tokens are minted for 10 minutes
+const TOKEN_TTL_MS = 8 * 60 * 1000; // a token can open a connection for 10 minutes after it is minted
 const IDLE_PAUSE_MS = 4 * 60 * 1000; // pause after this long without the student
 /** The pause left between one of Ceeq's turns and the next when they follow straight on. */
 const BREATH_SECONDS = 0.7;
-/** Speech held back as a possible second take is let through after this long if nothing settles it. */
-const HOLD_LIMIT_MS = 4000;
 // While Ceeq speaks, mic chunks quieter than this are treated as her own echo.
 const BARGE_IN_RMS = 0.045;
+/** For this long after the mic last picked up something that loud, the student is taken to be still talking. */
+const VOICE_HANG_MS = 900;
+/** How often the lesson is checked for a turn that never ended or a reply that never came. */
+const WATCH_MS = 500;
+/**
+ * Her speech arrives in a steady stream, followed at once by word that it has
+ * all come. If a turn is still open and nothing has come for this long, the
+ * service has abandoned the reply, and the connection with it.
+ */
+const STALLED_MS = 4000;
+/** How long Ceeq may stay silent when she is due to speak before something is done about it. */
+const NO_REPLY_MS = 10_000;
+/**
+ * After a tool call is answered the service sends something within two
+ * seconds: more speech, another call, or word that her speech has all arrived
+ * (when the call came after it). Silence this long means the connection is dead.
+ */
+const STUCK_MS = 3500;
+/** Speech that arrives this long after the app moved on, with the old turn never closed, belongs to the new turn. */
+const MOVED_ON_MS = 1500;
+/** The loudness of her speech is noted at this resolution, for finding pauses. */
+const LEVEL_FRAME_SECONDS = 0.02;
 
-export function useCeeqVoice({ getToken, onToolCall, speed, onTurnEnd, onStudentInput }: Options) {
+/** A piece of a turn's speech that has been queued for playing. */
+interface Piece {
+  src: AudioBufferSourceNode;
+  startAt: number;
+  duration: number;
+  /** The part of the turn's speech it carries, in seconds as received (before slowing). */
+  fromSeconds: number;
+  toSeconds: number;
+}
+
+export function useCeeqVoice({ getToken, onToolCall, speed, onTurnEnd, onStudentInput, onSilence }: Options) {
   const [status, setStatus] = useState<VoiceStatus>("idle");
   const [activity, setActivity] = useState<VoiceActivity>("idle");
   const [micOn, setMicOn] = useState(false);
   const [caption, setCaption] = useState("");
-  const [heard, setHeard] = useState("");
+  const [heard, setHeardState] = useState("");
   const [error, setError] = useState<string | null>(null);
+
+  // Her latest words and the student's are also needed outside render, to carry a lesson over to a new connection.
+  const captionRef = useRef("");
+  const heardRef = useRef("");
+  const showCaption = useCallback((text: string) => {
+    captionRef.current = text;
+    setCaption(text);
+  }, []);
+  const setHeard = useCallback((text: string) => {
+    heardRef.current = text;
+    setHeardState(text);
+  }, []);
 
   const sessionRef = useRef<Session | null>(null);
   const generationRef = useRef(0);
+  /** The generation of the lesson start now under way, if one is. */
+  const startingRef = useRef<number | null>(null);
   const toolRef = useRef(onToolCall);
   const turnEndRef = useRef(onTurnEnd);
   const studentInputRef = useRef(onStudentInput);
+  const silenceRef = useRef(onSilence);
   useEffect(() => {
     toolRef.current = onToolCall;
     turnEndRef.current = onTurnEnd;
     studentInputRef.current = onStudentInput;
-  }, [onToolCall, onTurnEnd, onStudentInput]);
+    silenceRef.current = onSilence;
+  }, [onToolCall, onTurnEnd, onStudentInput, onSilence]);
 
-  // ---------- End of Ceeq's turn ----------
+  // ---------- Where Ceeq's turn has got to ----------
   //
-  // The service says a turn is complete at about the moment its audio would
-  // finish at normal speed. Slowed audio is still playing then, so the caller
-  // is told how much is left and can time what happens next around it.
+  // Her speech arrives several times faster than it is spoken, and is played
+  // slower still. The lesson is paced by what the student has heard: a turn is
+  // over for the app once all its speech has arrived, and the app is told how
+  // much of it is still to play. The service's own "turn complete" comes when
+  // it reckons the speech has been heard at normal speed. That can be half a
+  // minute late (when she says more than is played) or never, so it is only a
+  // fallback. Prompting her before then simply cuts the service's turn short.
 
-  /** Audio for a turn has started arriving and the service has not yet said the turn is complete. */
+  /** Speech for a turn is arriving and the app has not yet been told the turn is over. */
   const midTurnRef = useRef(false);
-  /** The current turn was cut short by the student, so its "complete" signal does not count. */
-  const interruptedRef = useRef(false);
+  /** The app has been told that the turn it is waiting for is over. False from when one is due until it ends. */
+  const turnEndedRef = useRef(true);
+  /** Speech of the turn the app is waiting for has started to arrive (and not just the tail of the one before). */
+  const awaitedBegunRef = useRef(false);
+  /** The service has sent something for a turn and not yet said it is complete or interrupted. */
+  const serverTurnOpenRef = useRef(false);
+  /** The next "complete" from the service belongs to a turn already moved on from, and does not count. */
+  const staleCompleteRef = useRef(false);
+  /** The app itself prompted her before the service closed her turn, so the "interrupted" that follows is not the student. */
+  const selfCutRef = useRef(false);
+  /** When the app moved on from a turn the service still had open. */
+  const movedOnAtRef = useRef<number | null>(null);
   /** The student said or typed something since Ceeq's last finished turn. */
   const afterStudentRef = useRef(false);
+  /** Since when Ceeq has been due to speak, or null if she is not. */
+  const owedSinceRef = useRef<number | null>(null);
+  const nudgesRef = useRef(0);
+  const lastServerAtRef = useRef(0);
+  /** When a tool call was last answered, until the service says anything more. */
+  const toolAnsweredAtRef = useRef<number | null>(null);
+  /** The service has said this connection will end shortly. */
+  const closingRef = useRef(false);
+  /** A prompt from the app that came while one connection was being replaced by another. */
+  const pendingPromptRef = useRef<string | null>(null);
+  /** Since when nothing has been playing, or null while she can be heard. */
+  const drainedAtRef = useRef<number | null>(null);
 
   // ---------- Token prefetch ----------
 
@@ -113,6 +219,15 @@ export function useCeeqVoice({ getToken, onToolCall, speed, onTurnEnd, onStudent
   const heldRef = useRef(false);
   /** The next audio to be queued is the start of a new turn. */
   const breathRef = useRef(false);
+
+  // The current turn's speech: what has been queued, and how loud it was moment
+  // by moment, so that a repeated paragraph can be cut out between sentences.
+  const speechRef = useRef<TurnSpeech<Float32Array> | null>(null);
+  const getSpeech = useCallback(() => (speechRef.current ??= new TurnSpeech<Float32Array>()), []);
+  const piecesRef = useRef<Piece[]>([]);
+  const turnSecondsRef = useRef(0);
+  const levelsRef = useRef<number[]>([]);
+  const levelRestRef = useRef({ sum: 0, count: 0 });
 
   const ensurePlayback = useCallback(() => {
     if (!playCtxRef.current) {
@@ -179,6 +294,7 @@ export function useCeeqVoice({ getToken, onToolCall, speed, onTurnEnd, onStudent
       }
     });
     sourcesRef.current = [];
+    piecesRef.current = [];
     midTurnRef.current = false;
     stretcherRef.current?.reset();
     nextStartRef.current = playCtxRef.current?.currentTime ?? 0;
@@ -187,7 +303,7 @@ export function useCeeqVoice({ getToken, onToolCall, speed, onTurnEnd, onStudent
 
   /** Queues audio to play right after whatever is already queued. */
   const schedule = useCallback(
-    (samples: Float32Array) => {
+    (samples: Float32Array, fromSeconds = 0, toSeconds = 0) => {
       if (!samples.length) return;
       const ctx = ensurePlayback();
       const buffer = ctx.createBuffer(1, samples.length, PLAYBACK_SAMPLE_RATE);
@@ -206,6 +322,7 @@ export function useCeeqVoice({ getToken, onToolCall, speed, onTurnEnd, onStudent
       src.start(startAt);
       nextStartRef.current = startAt + buffer.duration;
       sourcesRef.current.push(src);
+      if (toSeconds > fromSeconds) piecesRef.current.push({ src, startAt, duration: buffer.duration, fromSeconds, toSeconds });
       setSpeaking(true);
       src.onended = () => {
         sourcesRef.current = sourcesRef.current.filter((s) => s !== src);
@@ -221,13 +338,22 @@ export function useCeeqVoice({ getToken, onToolCall, speed, onTurnEnd, onStudent
     return ctx ? Math.max(0, nextStartRef.current - ctx.currentTime) * 1000 : 0;
   }, []);
 
-  const playChunk = useCallback(
-    (b64: string) => {
-      const binary = atob(b64);
-      const bytes = new Uint8Array(binary.length);
-      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-      const int16 = new Int16Array(bytes.buffer, 0, bytes.byteLength >> 1);
-      schedule(getStretcher().process(Float32Array.from(int16, (s) => s / 32768)));
+  /** Queues a piece of the current turn's speech, noting where in the turn it falls and how loud it is. */
+  const playSpeech = useCallback(
+    (pcm: Float32Array) => {
+      const from = turnSecondsRef.current;
+      turnSecondsRef.current += pcm.length / PLAYBACK_SAMPLE_RATE;
+      const frame = Math.round(LEVEL_FRAME_SECONDS * PLAYBACK_SAMPLE_RATE);
+      const rest = levelRestRef.current;
+      for (const sample of pcm) {
+        rest.sum += sample * sample;
+        if (++rest.count === frame) {
+          levelsRef.current.push(Math.sqrt(rest.sum / frame));
+          rest.sum = 0;
+          rest.count = 0;
+        }
+      }
+      schedule(getStretcher().process(pcm), from, turnSecondsRef.current);
     },
     [getStretcher, schedule],
   );
@@ -236,6 +362,31 @@ export function useCeeqVoice({ getToken, onToolCall, speed, onTurnEnd, onStudent
   const finishUtterance = useCallback(() => {
     if (stretcherRef.current) schedule(stretcherRef.current.flush());
   }, [schedule]);
+
+  /** Takes back the current turn's queued speech from `seconds` into the turn onwards. */
+  const cutSpeech = useCallback((seconds: number) => {
+    const ctx = playCtxRef.current;
+    if (!ctx) return;
+    let cutAt: number | null = null;
+    const kept: Piece[] = [];
+    for (const piece of piecesRef.current) {
+      if (piece.toSeconds <= seconds) {
+        kept.push(piece);
+        continue;
+      }
+      // The piece the cut falls in plays up to the cut; later ones are never heard.
+      const within = piece.fromSeconds < seconds ? ((seconds - piece.fromSeconds) / (piece.toSeconds - piece.fromSeconds)) * piece.duration : 0;
+      cutAt ??= piece.startAt + within;
+      try {
+        piece.src.stop(Math.max(ctx.currentTime, piece.startAt + within));
+      } catch {
+        // already stopped
+      }
+    }
+    piecesRef.current = kept;
+    if (cutAt !== null) nextStartRef.current = Math.max(ctx.currentTime, cutAt);
+    stretcherRef.current?.reset();
+  }, []);
 
   // ---------- Idle pause ----------
 
@@ -250,34 +401,81 @@ export function useCeeqVoice({ getToken, onToolCall, speed, onTurnEnd, onStudent
 
   const thinkingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Guards against Ceeq saying a paragraph twice around a late tool call (see secondTake.ts).
-  const takeRef = useRef<SecondTake<string> | null>(null);
-  const holdTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const getTake = useCallback(() => (takeRef.current ??= new SecondTake<string>()), []);
-  /** Forgets speech that was being held back: the turn it belonged to is over. */
-  const dropHeld = useCallback(() => {
-    if (holdTimerRef.current) clearTimeout(holdTimerRef.current);
-    holdTimerRef.current = null;
-    takeRef.current?.endTurn();
-  }, []);
-  /** Plays and shows whatever the guard has let through. */
-  const letThrough = useCallback(
-    ({ show, play }: Released<string>) => {
-      play.forEach(playChunk);
-      if (show) setCaption((prev) => prev + show);
-      if (!takeRef.current?.holding && holdTimerRef.current) {
-        clearTimeout(holdTimerRef.current);
-        holdTimerRef.current = null;
-      }
+  /** Tells the app the current turn is over, once. */
+  const completeTurn = useCallback(
+    (silent: boolean) => {
+      if (turnEndedRef.current) return;
+      turnEndedRef.current = true;
+      midTurnRef.current = false;
+      setHeard("");
+      const afterStudent = afterStudentRef.current;
+      afterStudentRef.current = false;
+      turnEndRef.current?.({ afterStudent, remainingMs: remainingMs(), silent });
     },
-    [playChunk],
+    [remainingMs, setHeard],
   );
+
+  /** The rest of the turn is not to be heard: cuts what must not play and ends the turn for the app. */
+  const endSpeech = useCallback(
+    (cut: Cut) => {
+      if (cut.at === null) finishUtterance();
+      // Cut in a pause if she makes one near there; otherwise a little after, to be sure of her last word.
+      else cutSpeech(pauseNear(levelsRef.current, LEVEL_FRAME_SECONDS, cut.at) ?? cut.at + 0.25);
+      completeTurn(false);
+    },
+    [completeTurn, cutSpeech, finishUtterance],
+  );
+
+  /** Ceeq is now due to say something: an opening, a reply, or the next step. */
+  const expectReply = useCallback(() => {
+    owedSinceRef.current = Date.now();
+    turnEndedRef.current = false;
+    awaitedBegunRef.current = false;
+  }, []);
+
+  /** The app is moving on (a prompt, or the student typing) whether or not the service has closed her turn. */
+  const moveOn = useCallback(
+    (byStudent: boolean) => {
+      if (serverTurnOpenRef.current) {
+        // What is still to come of the old turn is dropped, and its "complete" must not be taken for the new one's.
+        staleCompleteRef.current = true;
+        selfCutRef.current = !byStudent;
+        movedOnAtRef.current = Date.now();
+        getSpeech().abandon();
+      }
+      newTurnRef.current = true;
+      expectReply();
+    },
+    [expectReply, getSpeech],
+  );
+
+  /** The service never closed the turn the app moved on from, and has plainly started the next. */
+  const startedAnyway = useCallback(() => {
+    if (movedOnAtRef.current === null || Date.now() - movedOnAtRef.current < MOVED_ON_MS) return;
+    movedOnAtRef.current = null;
+    getSpeech().endTurn();
+    newTurnRef.current = true;
+  }, [getSpeech]);
 
   const handleMessage = useCallback(
     (message: LiveServerMessage) => {
+      if (message.goAway) {
+        // Notice that the connection is about to end. A token is fetched now, so that carrying on over a new one is quick.
+        closingRef.current = true;
+        prepare();
+      }
       const calls = message.toolCall?.functionCalls;
+      const content = message.serverContent;
+      // Anything from her after a tool call was answered shows the connection is alive.
+      if (calls?.length || content?.modelTurn || content?.outputTranscription || content?.generationComplete || content?.turnComplete || content?.interrupted) {
+        toolAnsweredAtRef.current = null;
+      }
       if (calls?.length) {
-        getTake().toolCall();
+        startedAnyway();
+        serverTurnOpenRef.current = true;
+        lastServerAtRef.current = Date.now();
+        const step = getSpeech().toolCall();
+        if (step.over) endSpeech(step.over);
         const functionResponses = calls.map((call) => {
           let response: Record<string, unknown>;
           try {
@@ -289,25 +487,40 @@ export function useCeeqVoice({ getToken, onToolCall, speed, onTurnEnd, onStudent
           return { id: call.id, name: call.name, response };
         });
         sessionRef.current?.sendToolResponse({ functionResponses });
+        toolAnsweredAtRef.current = Date.now();
       }
 
-      const content = message.serverContent;
       if (!content) return;
 
       if (content.interrupted) {
-        // Whatever was held back belongs to the turn the student has just cut short.
-        dropHeld();
-        stopPlayback();
+        // When the app's own prompt cut the service's turn short, what is queued must still be heard.
+        // Otherwise the student has cut in. Their words take a few seconds more to arrive, and the
+        // app must know now, or it would ask her to carry on before she has answered them.
+        if (!selfCutRef.current) {
+          stopPlayback();
+          afterStudentRef.current = true;
+          studentInputRef.current?.();
+        }
+        selfCutRef.current = false;
+        movedOnAtRef.current = null;
+        serverTurnOpenRef.current = false;
+        // The turn that was cut is closed with a "complete" that says nothing about the next one.
+        staleCompleteRef.current = true;
+        getSpeech().endTurn();
         newTurnRef.current = true;
-        interruptedRef.current = true;
+        // Whoever cut in, a new turn is now due.
+        expectReply();
       }
 
       const heardDelta = content.inputTranscription?.text;
       if (heardDelta) {
         touch();
         afterStudentRef.current = true;
+        // Heard while her speech is still arriving, it may be the student cutting in (the service will say so)
+        // or only a noise, after which her turn ends as usual. Once her turn is over, it calls for a reply.
+        if (!midTurnRef.current) expectReply();
         studentInputRef.current?.();
-        setHeard((prev) => prev + heardDelta);
+        setHeard(heardRef.current + heardDelta);
         if (!speakingRef.current) setActivity("listening");
         // Once the student's words stop arriving, Ceeq is working on a reply.
         if (thinkingTimerRef.current) clearTimeout(thinkingTimerRef.current);
@@ -318,43 +531,67 @@ export function useCeeqVoice({ getToken, onToolCall, speed, onTurnEnd, onStudent
 
       for (const part of content.modelTurn?.parts ?? []) {
         if (!part.inlineData?.data) continue;
-        if (newTurnRef.current) {
+        startedAnyway();
+        const speech = getSpeech();
+        lastServerAtRef.current = Date.now();
+        if (newTurnRef.current && !speech.over) {
           newTurnRef.current = false;
-          interruptedRef.current = false;
+          serverTurnOpenRef.current = true;
+          turnEndedRef.current = false;
+          awaitedBegunRef.current = true;
+          staleCompleteRef.current = false;
+          selfCutRef.current = false;
           midTurnRef.current = true;
           breathRef.current = true;
-          setCaption("");
+          owedSinceRef.current = null;
+          nudgesRef.current = 0;
+          piecesRef.current = [];
+          levelsRef.current = [];
+          levelRestRef.current = { sum: 0, count: 0 };
+          turnSecondsRef.current = 0;
+          showCaption(speech.caption);
         }
-        getTake().audio(part.inlineData.data).forEach(playChunk);
-        if (getTake().holding && !holdTimerRef.current) {
-          // Without a transcript to settle it, held speech must not stay unheard for long.
-          holdTimerRef.current = setTimeout(() => {
-            holdTimerRef.current = null;
-            letThrough(getTake().release());
-          }, HOLD_LIMIT_MS);
-        }
+        if (speech.over) continue;
+        const pcm = decodePcm(part.inlineData.data);
+        const step = speech.audio(pcm, pcm.length / PLAYBACK_SAMPLE_RATE);
+        step.play.forEach(playSpeech);
+        if (step.over) endSpeech(step.over);
       }
 
       const spokenDelta = content.outputTranscription?.text;
-      if (spokenDelta) letThrough(getTake().text(spokenDelta));
+      if (spokenDelta) {
+        const speech = getSpeech();
+        const step = speech.text(spokenDelta);
+        if (!speech.over || step.over) showCaption(speech.caption);
+        if (step.over) endSpeech(step.over);
+      }
 
-      if (content.turnComplete) {
-        letThrough(getTake().endTurn());
-        finishUtterance();
-        newTurnRef.current = true;
-        setHeard("");
-        midTurnRef.current = false;
-        if (interruptedRef.current) {
-          // The student cut this turn short; Ceeq's reply to them is the turn that counts.
-          interruptedRef.current = false;
-        } else {
-          const afterStudent = afterStudentRef.current;
-          afterStudentRef.current = false;
-          turnEndRef.current?.({ afterStudent, remainingMs: remainingMs() });
+      // All of her speech for this turn has arrived: the app can plan what comes after it.
+      // (A late signal about a turn already moved on from is not the end of the one now due.)
+      if (content.generationComplete && serverTurnOpenRef.current) {
+        const speech = getSpeech();
+        if (awaitedBegunRef.current || !speech.spoken) {
+          if (!speech.over) finishUtterance();
+          completeTurn(!speech.spoken);
         }
       }
+
+      if (content.turnComplete) {
+        const speech = getSpeech();
+        const stale = staleCompleteRef.current;
+        staleCompleteRef.current = false;
+        selfCutRef.current = false;
+        movedOnAtRef.current = null;
+        serverTurnOpenRef.current = false;
+        newTurnRef.current = true;
+        if (!stale && (awaitedBegunRef.current || !speech.spoken)) {
+          if (!speech.over) finishUtterance();
+          completeTurn(!speech.spoken);
+        }
+        speech.endTurn();
+      }
     },
-    [dropHeld, finishUtterance, getTake, letThrough, playChunk, remainingMs, stopPlayback, touch],
+    [completeTurn, endSpeech, expectReply, finishUtterance, getSpeech, playSpeech, prepare, setHeard, showCaption, startedAnyway, stopPlayback, touch],
   );
 
   // ---------- Mic (hands-free) ----------
@@ -362,6 +599,8 @@ export function useCeeqVoice({ getToken, onToolCall, speed, onTurnEnd, onStudent
   const micStreamRef = useRef<MediaStream | null>(null);
   const micCtxRef = useRef<AudioContext | null>(null);
   const micNodeRef = useRef<AudioWorkletNode | null>(null);
+  /** When the mic last picked up something as loud as a voice. */
+  const loudAtRef = useRef(0);
 
   const stopMic = useCallback(() => {
     if (micNodeRef.current) {
@@ -396,11 +635,12 @@ export function useCeeqVoice({ getToken, onToolCall, speed, onTurnEnd, onStudent
       micNodeRef.current = node;
       node.port.onmessage = (event) => {
         const int16 = new Int16Array(event.data as ArrayBuffer);
-        // Echo gate: while Ceeq talks, only clearly louder speech gets through.
-        if (speakingRef.current && rms(int16) < BARGE_IN_RMS) return;
-        session.sendRealtimeInput({
-          audio: { data: int16ToBase64(int16), mimeType: `audio/pcm;rate=${MIC_SAMPLE_RATE}` },
-        });
+        const loud = rms(int16) >= BARGE_IN_RMS;
+        if (loud) loudAtRef.current = Date.now();
+        // Echo gate: while Ceeq talks, only clearly louder speech gets through. The rest goes
+        // as silence, so that the sound the service receives never stops (see HUSH_MS).
+        const heard = speakingRef.current && !loud ? new Int16Array(int16.length) : int16;
+        session.sendRealtimeInput({ audio: { data: int16ToBase64(heard), mimeType: MIC_FORMAT } });
       };
       const silent = ctx.createGain();
       silent.gain.value = 0;
@@ -415,102 +655,329 @@ export function useCeeqVoice({ getToken, onToolCall, speed, onTurnEnd, onStudent
     }
   }, [stopMic]);
 
+  /** Whether the student wants the mic on. Kept across a reconnection. */
+  const wantMicRef = useRef(true);
+  /** Whether the app wants Ceeq to be listening just now. */
+  const hearingRef = useRef(true);
   const toggleMic = useCallback(() => {
+    wantMicRef.current = !micStreamRef.current;
     if (micStreamRef.current) stopMic();
-    else void startMic();
+    else {
+      // The student asking for the mic counts for more than the app's wish for quiet.
+      hearingRef.current = true;
+      void startMic();
+    }
   }, [startMic, stopMic]);
 
+  /**
+   * Stops Ceeq listening for a while (during a written quiz, say), or lets her
+   * listen again. What the student chose with the mic button stays as it was.
+   */
+  const setHearing = useCallback(
+    (on: boolean) => {
+      if (hearingRef.current === on) return;
+      hearingRef.current = on;
+      if (!on) stopMic();
+      else if (wantMicRef.current && sessionRef.current) void startMic();
+    },
+    [startMic, stopMic],
+  );
+
   // ---------- Connection ----------
+
+  /** Forgets where the conversation with the service had got to: the next thing heard starts afresh. */
+  const forgetTurn = useCallback(() => {
+    speechRef.current?.endTurn();
+    newTurnRef.current = true;
+    midTurnRef.current = false;
+    turnEndedRef.current = true;
+    awaitedBegunRef.current = false;
+    serverTurnOpenRef.current = false;
+    staleCompleteRef.current = false;
+    selfCutRef.current = false;
+    movedOnAtRef.current = null;
+    afterStudentRef.current = false;
+    owedSinceRef.current = null;
+    toolAnsweredAtRef.current = null;
+    nudgesRef.current = 0;
+  }, []);
 
   const teardown = useCallback(() => {
     generationRef.current++;
     if (idleTimerRef.current) clearTimeout(idleTimerRef.current);
     if (thinkingTimerRef.current) clearTimeout(thinkingTimerRef.current);
-    dropHeld();
     stopMic();
     stopPlayback();
     releasePlayback();
-    interruptedRef.current = false;
-    afterStudentRef.current = false;
+    forgetTurn();
+    drainedAtRef.current = null;
     sessionRef.current?.close();
     sessionRef.current = null;
+    closingRef.current = false;
+    pendingPromptRef.current = null;
     setActivity("idle");
     setHeard("");
-  }, [dropHeld, releasePlayback, stopMic, stopPlayback]);
+  }, [forgetTurn, releasePlayback, setHeard, stopMic, stopPlayback]);
 
   const pause = useCallback(() => {
     teardown();
     setStatus("paused");
   }, [teardown]);
 
+  const statusRef = useRef(status);
+  useEffect(() => {
+    statusRef.current = status;
+  }, [status]);
+
   useEffect(() => {
     pauseRef.current = pause;
   }, [pause]);
 
-  /** Starts a live lesson. `opening` tells Ceeq where to begin. Call from a click. */
-  const connect = useCallback(
-    async (opening: string) => {
-      if (sessionRef.current) return;
-      const generation = ++generationRef.current;
-      const stale = () => generation !== generationRef.current;
-      ensurePlayback(); // must happen inside the click for browsers to allow sound
-      setStatus("connecting");
-      setError(null);
-      setCaption("");
+  // Three ways the service lets a lesson down. A reply that never comes (an
+  // empty turn): the app is told, and prompts her again. A connection that goes
+  // dead after a tool call, and a reply abandoned part-way, which leaves the
+  // connection just as dead: the app is told, and replaces it. If the app can
+  // do nothing, the lesson is paused.
+  useEffect(() => {
+    if (status !== "live") return;
+    const timer = setInterval(() => {
+      const now = Date.now();
+      if (remainingMs() > 0 || heldRef.current) drainedAtRef.current = null;
+      else drainedAtRef.current ??= now;
+      const quietFor = drainedAtRef.current === null ? 0 : now - drainedAtRef.current;
 
+      const giveUp = () => {
+        setError("Ceeq stopped responding. Press Start to carry on.");
+        pauseRef.current();
+      };
+      if (serverTurnOpenRef.current && !turnEndedRef.current && awaitedBegunRef.current && !heldRef.current && now - lastServerAtRef.current > STALLED_MS) {
+        // The last few milliseconds are only worth playing if they follow straight on.
+        if (remainingMs() > 0) finishUtterance();
+        else stretcherRef.current?.reset();
+        serverTurnOpenRef.current = false;
+        // If she got to the end of a sentence, the turn can pass for finished. If not it stays
+        // unfinished, and she is asked for the rest of it on the new connection.
+        if (endsSentence(captionRef.current)) completeTurn(false);
+        if (!silenceRef.current?.("stuck", 1)) giveUp();
+        return;
+      }
+      if (toolAnsweredAtRef.current !== null && now - toolAnsweredAtRef.current > STUCK_MS) {
+        toolAnsweredAtRef.current = null;
+        if (!silenceRef.current?.("stuck", 1)) giveUp();
+        return;
+      }
+      // The service has given notice that this connection will end. Between her turns, with
+      // nobody speaking, is the moment to move to a new one without the student noticing.
+      if (closingRef.current && sessionRef.current && turnEndedRef.current && owedSinceRef.current === null && now - loudAtRef.current > VOICE_HANG_MS) {
+        closingRef.current = false;
+        silenceRef.current?.("closing", 1);
+        return;
+      }
+      // Silence only counts from when she was due to speak, and not while she can still be heard.
+      if (owedSinceRef.current === null || Math.min(quietFor, now - owedSinceRef.current) < NO_REPLY_MS) return;
+      owedSinceRef.current = now;
+      if (!silenceRef.current?.("no-reply", ++nudgesRef.current)) giveUp();
+    }, WATCH_MS);
+    return () => clearInterval(timer);
+  }, [status, completeTurn, finishUtterance, remainingMs]);
+
+  // While the mic is not feeding the service, silence is sent in its place (see HUSH_MS).
+  useEffect(() => {
+    if (status !== "live") return;
+    const hush = int16ToBase64(new Int16Array((MIC_SAMPLE_RATE * HUSH_MS) / 1000));
+    const timer = setInterval(() => {
+      if (!micNodeRef.current) sessionRef.current?.sendRealtimeInput({ audio: { data: hush, mimeType: MIC_FORMAT } });
+    }, HUSH_MS);
+    return () => clearInterval(timer);
+  }, [status]);
+
+  /**
+   * Opens one connection to the service with a new token. The service does not
+   * always let one open: it can refuse, or leave the attempt hanging (the
+   * library then waits for ever). Either way this fails, within CONNECT_TIMEOUT_MS.
+   */
+  const dial = useCallback(
+    async (stale: () => boolean): Promise<Session> => {
+      // What this attempt may still do: nothing once it has been given up, and its closing only counts once it has opened.
+      const link = { open: false, dropped: false };
+      let fail: (reason: Error) => void = () => {};
+      const failed = new Promise<never>((_, reject) => {
+        fail = reject;
+      });
+      const timer = setTimeout(() => fail(new Error("Ceeq's voice took too long to connect.")), CONNECT_TIMEOUT_MS);
       try {
-        const { token, model } = await takeToken();
-        if (stale()) return;
+        const { token, model } = await Promise.race([takeToken(), failed]);
         const ai = new GoogleGenAI({ apiKey: token, httpOptions: { apiVersion: "v1alpha" } });
-        const session = await ai.live.connect({
+        const opening = ai.live.connect({
           model,
           callbacks: {
             onmessage: (message) => {
-              if (!stale()) handleMessage(message);
+              if (!stale() && !link.dropped) handleMessage(message);
             },
             onerror: (e) => {
-              if (stale()) return;
+              if (stale() || link.dropped) return;
               console.error("Voice error:", e);
-              setError("Ceeq's connection dropped.");
+              if (!link.open) fail(new Error("Ceeq's voice could not connect."));
             },
             onclose: () => {
-              if (stale()) return;
+              if (stale() || link.dropped) return;
+              if (!link.open) return fail(new Error("Ceeq's voice could not connect."));
+              // The app is asked to carry the lesson on over a new connection. If it cannot, the lesson is paused.
+              sessionRef.current = null;
+              if (silenceRef.current?.("closed", 1)) return;
               teardown();
               setStatus("paused");
             },
           },
         });
-        if (stale()) {
-          session.close();
-          return;
-        }
-        sessionRef.current = session;
-        setStatus("live");
-        newTurnRef.current = true;
-        session.sendClientContent({ turns: [{ role: "user", parts: [{ text: opening }] }], turnComplete: true });
-        touch();
-        void startMic();
-        prepare(); // ready for a quick resume later
+        // One that opens after it was given up is closed again at once.
+        opening.then(
+          (late) => link.dropped && late.close(),
+          () => {},
+        );
+        const session = await Promise.race([opening, failed]);
+        link.open = true;
+        return session;
       } catch (err) {
-        if (stale()) return;
-        console.error("Voice connection failed:", err);
-        setError(err instanceof Error ? err.message : "Could not start Ceeq's voice.");
-        setStatus("error");
+        link.dropped = true;
+        throw err;
+      } finally {
+        clearTimeout(timer);
       }
     },
-    [ensurePlayback, handleMessage, prepare, startMic, takeToken, teardown, touch],
+    [handleMessage, takeToken, teardown],
+  );
+
+  /**
+   * Opens a connection to the service, trying again if the first attempt
+   * fails; `start` then tells Ceeq where to begin. False if it was overtaken
+   * by a later one.
+   */
+  const openSession = useCallback(
+    async (start: (session: Session) => void, generation: number) => {
+      const stale = () => generation !== generationRef.current;
+      let session: Session | undefined;
+      for (let attempt = 1; !session; attempt++) {
+        try {
+          session = await dial(stale);
+        } catch (err) {
+          if (stale()) return false;
+          if (attempt >= CONNECT_TRIES) throw err;
+          console.warn(`Voice connection attempt ${attempt} failed:`, err);
+          await new Promise((resolve) => setTimeout(resolve, 500 * attempt));
+        }
+        if (stale()) {
+          session?.close();
+          return false;
+        }
+      }
+      sessionRef.current = session;
+      closingRef.current = false;
+      forgetTurn();
+      start(session);
+      // What the app asked of her while there was no connection is asked now.
+      const waiting = pendingPromptRef.current;
+      pendingPromptRef.current = null;
+      if (waiting) {
+        expectReply();
+        session.sendClientContent({ turns: [{ role: "user", parts: [{ text: waiting }] }], turnComplete: true });
+      }
+      touch();
+      if (wantMicRef.current && hearingRef.current) void startMic();
+      prepare(); // ready for a quick resume later
+      return true;
+    },
+    [dial, expectReply, forgetTurn, prepare, startMic, touch],
+  );
+
+  /** Starts a live lesson. `opening` tells Ceeq where to begin. Call from a click. */
+  const connect = useCallback(
+    async (opening: string) => {
+      // A lesson that is running, or already starting, is left alone: Start may be pressed twice,
+      // or pressed just as the page starts the lesson by itself.
+      if (sessionRef.current || startingRef.current === generationRef.current) return;
+      const generation = ++generationRef.current;
+      startingRef.current = generation;
+      ensurePlayback(); // must happen inside the click for browsers to allow sound
+      setStatus("connecting");
+      setError(null);
+      showCaption("");
+      wantMicRef.current = true;
+      const start = (session: Session) => {
+        expectReply();
+        session.sendClientContent({ turns: [{ role: "user", parts: [{ text: opening }] }], turnComplete: true });
+      };
+      try {
+        if (await openSession(start, generation)) setStatus("live");
+      } catch (err) {
+        if (generation !== generationRef.current) return;
+        console.error("Voice connection failed:", err);
+        setError(`${err instanceof Error ? err.message.replace(/\.$/, "") : "Could not start Ceeq's voice"}. Press Start to try again.`);
+        setStatus("error");
+      } finally {
+        if (startingRef.current === generation) startingRef.current = null;
+      }
+    },
+    [ensurePlayback, expectReply, openSession, showCaption],
+  );
+
+  /**
+   * Carries the lesson over to a new connection: one that has ended, gone
+   * dead, or is about to end. The lesson stays on screen as it is, and what is
+   * queued goes on playing. The new Ceeq is told where the lesson stands and
+   * what she last said, without being asked to speak, unless something was
+   * waiting on her (a reply she owed, or the rest of one she was cut off in):
+   * then the student's words are put to her again, or the app's prompt is.
+   * False if the lesson is not running.
+   */
+  const reconnect = useCallback(
+    (carry: CarryOver) => {
+      if (statusRef.current !== "live") return false;
+      const old = sessionRef.current;
+      // Something is waiting on her if she was due to speak, or was cut off part-way through speaking.
+      const due = owedSinceRef.current !== null || midTurnRef.current;
+      const unanswered = afterStudentRef.current ? heardRef.current.trim() : "";
+      // From here the old connection's messages, and its closing, no longer count.
+      const generation = ++generationRef.current;
+      stopMic();
+      sessionRef.current = null;
+      old?.close();
+      forgetTurn();
+      const start = (session: Session) => {
+        const history = [
+          { role: "user", parts: [{ text: carry.note }] },
+          ...(carry.lastWords ? [{ role: "model", parts: [{ text: carry.lastWords }] }] : []),
+        ];
+        if (unanswered) {
+          session.sendClientContent({ turns: history, turnComplete: false });
+          afterStudentRef.current = true;
+          expectReply();
+          session.sendRealtimeInput({ text: unanswered });
+        } else if (due || !carry.lastWords) {
+          expectReply();
+          session.sendClientContent({ turns: [...history, { role: "user", parts: [{ text: carry.prompt }] }], turnComplete: true });
+        } else {
+          session.sendClientContent({ turns: history, turnComplete: false });
+        }
+      };
+      openSession(start, generation).catch((err: unknown) => {
+        if (generation !== generationRef.current) return;
+        console.error("Voice reconnection failed:", err);
+        setError("Ceeq's connection dropped. Press Start to carry on.");
+        pauseRef.current();
+      });
+      return true;
+    },
+    [expectReply, forgetTurn, openSession, stopMic],
   );
 
   const sendText = useCallback(
     (text: string) => {
       const trimmed = text.trim();
       if (!sessionRef.current || !trimmed) return false;
-      // Typing over Ceeq cuts her off, like speaking over her. If her turn was
-      // still under way, its "complete" signal is yet to come and must not count.
-      interruptedRef.current = midTurnRef.current;
-      dropHeld();
+      // Typing over Ceeq cuts her off, like speaking over her.
+      moveOn(true);
       stopPlayback();
-      newTurnRef.current = true;
       afterStudentRef.current = true;
       studentInputRef.current?.();
       setHeard(trimmed);
@@ -519,19 +986,24 @@ export function useCeeqVoice({ getToken, onToolCall, speed, onTurnEnd, onStudent
       touch();
       return true;
     },
-    [dropHeld, stopPlayback, touch],
+    [moveOn, setHeard, stopPlayback, touch],
   );
 
   /** Tells Ceeq something from the app (e.g. a quiz result) without showing it as the student's words. */
   const notify = useCallback(
     (text: string) => {
-      if (!sessionRef.current) return false;
-      newTurnRef.current = true;
+      if (!sessionRef.current) {
+        // Between connections, the prompt is kept and put to her as soon as the new one is open.
+        if (statusRef.current !== "live") return false;
+        pendingPromptRef.current = text;
+        return true;
+      }
+      moveOn(false);
       sessionRef.current.sendClientContent({ turns: [{ role: "user", parts: [{ text }] }], turnComplete: true });
       touch();
       return true;
     },
-    [touch],
+    [moveOn, touch],
   );
 
   const end = useCallback(() => {
@@ -539,11 +1011,15 @@ export function useCeeqVoice({ getToken, onToolCall, speed, onTurnEnd, onStudent
     setStatus("idle");
   }, [teardown]);
 
+  /** The student is doing something other than talking (answering the quiz, say): the lesson is not to be paused as idle. */
+  const stillHere = useCallback(() => {
+    if (statusRef.current === "live") touch();
+  }, [touch]);
+
   useEffect(
     () => () => {
       generationRef.current++;
       if (idleTimerRef.current) clearTimeout(idleTimerRef.current);
-      if (holdTimerRef.current) clearTimeout(holdTimerRef.current);
       sessionRef.current?.close();
       micStreamRef.current?.getTracks().forEach((track) => track.stop());
       void micCtxRef.current?.close();
@@ -561,17 +1037,32 @@ export function useCeeqVoice({ getToken, onToolCall, speed, onTurnEnd, onStudent
     error,
     prepare,
     connect,
+    reconnect,
     end,
     toggleMic,
+    setHearing,
     sendText,
     notify,
+    stillHere,
     getLevel,
-    /** Whether a turn is still arriving from Ceeq, for use outside render. */
+    /** Whether speech for a turn is still arriving from Ceeq, for use outside render. */
     isMidTurn: () => midTurnRef.current,
+    /** Whether the mic is picking up a voice just now (or a noise as loud as one). */
+    isHearingVoice: () => micStreamRef.current !== null && Date.now() - loudAtRef.current < VOICE_HANG_MS,
+    /** The last thing Ceeq said, for use outside render. */
+    lastWords: () => captionRef.current,
     remainingMs,
     holdPlayback,
     releasePlayback,
   };
+}
+
+function decodePcm(b64: string): Float32Array {
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  const int16 = new Int16Array(bytes.buffer, 0, bytes.byteLength >> 1);
+  return Float32Array.from(int16, (s) => s / 32768);
 }
 
 function rms(int16: Int16Array): number {

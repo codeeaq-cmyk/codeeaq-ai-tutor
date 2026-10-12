@@ -1,9 +1,16 @@
-import { GoogleGenAI } from '@google/genai';
+import { GoogleGenAI, type Schema } from '@google/genai';
 import { logger } from 'firebase-functions';
 
 type Attempt = { model: string; search: boolean };
 
-export type Ask = <T>(prompt: string, parse: (text: string) => T) => Promise<T>;
+/**
+ * `shape` is the form the reply must take. Given one, the service holds the
+ * model to it, so the reply is always JSON that can be read. Left to itself the
+ * model now and then drops a comma or adds a bracket, and at the low
+ * temperature used here it does so again when asked the same thing again.
+ * (A shape cannot be combined with web search, so it is left out of those attempts.)
+ */
+export type Ask = <T>(prompt: string, parse: (text: string) => T, shape?: Schema) => Promise<T>;
 
 /**
  * Asks the first model that answers. Models get refused for quota (429) or
@@ -32,7 +39,7 @@ export function createAsker(
   // When each attempt may be tried again, by index.
   const skipUntil = new Map<number, number>();
 
-  return async function ask<T>(prompt: string, parse: (text: string) => T): Promise<T> {
+  return async function ask<T>(prompt: string, parse: (text: string) => T, shape?: Schema): Promise<T> {
     let lastError: unknown = new Error('No text model configured');
     // If everything is currently being skipped, try them all rather than fail outright.
     const usable = attempts.map((_, i) => i).filter((i) => (skipUntil.get(i) ?? 0) <= Date.now());
@@ -44,7 +51,7 @@ export function createAsker(
           model,
           contents: prompt,
           config: {
-            ...(search ? { tools: [{ googleSearch: {} }] } : { responseMimeType: 'application/json' }),
+            ...(search ? { tools: [{ googleSearch: {} }] } : { responseMimeType: 'application/json', ...(shape ? { responseSchema: shape } : {}) }),
             temperature: 0.2,
             abortSignal: AbortSignal.timeout(timeoutMs),
           },
@@ -61,7 +68,7 @@ export function createAsker(
         return parse(text);
       } catch (err) {
         lastError = err;
-        logger.warn('Model reply unusable', { model, search, err: String(err).slice(0, 200) });
+        logger.warn('Model reply unusable', { model, search, err: String(err).slice(0, 200), reply: text.slice(0, 300) });
       }
     }
     throw lastError;

@@ -9,6 +9,7 @@ import {
   type GetQuizRequest,
   type QuizQuestion,
 } from '@codeeaq/shared-types';
+import { Type, type Schema } from '@google/genai';
 import { extractJson, plain, type Ask } from './ai';
 
 // Splits a chapter into modules and writes each module's quiz. Both answer
@@ -18,6 +19,39 @@ function describe({ profile, subject, chapter, unit }: ChapterRef): string {
   const cls = [boardName(profile.board), `Class ${profile.classLevel}`, streamName(profile.stream)].filter(Boolean).join(', ');
   return `${cls} ${plain(subject, 60)}${unit ? ` (${plain(unit, 60)})` : ''}, chapter "${plain(chapter)}"`;
 }
+
+// The form each reply must take (see Ask). The prompts describe the same shapes in words.
+const TEXT: Schema = { type: Type.STRING };
+const PLAN_SHAPE: Schema = {
+  type: Type.OBJECT,
+  properties: {
+    modules: {
+      type: Type.ARRAY,
+      items: { type: Type.OBJECT, properties: { title: TEXT, goals: { type: Type.ARRAY, items: TEXT } }, required: ['title', 'goals'] },
+    },
+  },
+  required: ['modules'],
+};
+const QUIZ_SHAPE: Schema = {
+  type: Type.OBJECT,
+  properties: {
+    questions: {
+      type: Type.ARRAY,
+      items: {
+        type: Type.OBJECT,
+        properties: {
+          question: TEXT,
+          options: { type: Type.ARRAY, items: TEXT },
+          answer: { type: Type.INTEGER },
+          explanation: TEXT,
+          goal: { type: Type.INTEGER },
+        },
+        required: ['question', 'options', 'answer', 'explanation', 'goal'],
+      },
+    },
+  },
+  required: ['questions'],
+};
 
 export function buildPlanPrompt(ref: ChapterRef): string {
   return `Split this chapter into study modules for a student: ${describe(ref)}.
@@ -71,7 +105,7 @@ export function generateChapterPlan(ask: Ask, ref: ChapterRef): Promise<ChapterP
   const key = [profile.board, profile.classLevel, profile.stream ?? '', ref.subject, ref.unit ?? '', ref.chapter].join('|').toLowerCase();
   let pending = planCache.get(key);
   if (!pending) {
-    pending = ask(buildPlanPrompt(ref), parsePlanReply);
+    pending = ask(buildPlanPrompt(ref), parsePlanReply, PLAN_SHAPE);
     planCache.set(key, pending);
     pending.catch(() => planCache.delete(key));
   }
@@ -79,5 +113,5 @@ export function generateChapterPlan(ask: Ask, ref: ChapterRef): Promise<ChapterP
 }
 
 export function generateQuiz(ask: Ask, request: GetQuizRequest): Promise<QuizQuestion[]> {
-  return ask(buildQuizPrompt(request), parseQuizReply);
+  return ask(buildQuizPrompt(request), parseQuizReply, QUIZ_SHAPE);
 }

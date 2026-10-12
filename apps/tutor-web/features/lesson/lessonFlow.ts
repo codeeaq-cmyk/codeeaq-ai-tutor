@@ -62,6 +62,69 @@ export function revisionOpening(done: number[] = []): string {
   return `(The student is here to revise this module. ${start} ${PACE_REMINDER})`;
 }
 
+// ---------- Carrying a lesson over to a new connection ----------
+//
+// A connection to the voice service lasts about ten minutes, can drop sooner,
+// and now and then goes dead. The lesson then carries on over a new one. The
+// Ceeq on it remembers nothing, so she is told where the lesson stands and
+// what she last said, and the student should not notice the join.
+
+/** Where a lesson has got to, as far as a Ceeq who has just been connected needs to know. */
+export type Stage =
+  | { at: LessonMode }
+  /** The quiz is on the student's screen. `report` is how they did, once they have finished it. */
+  | { at: "quiz"; report: string | null }
+  /** A revision: the goals (numbered from 1) dealt with so far, and whether the revision is over. */
+  | { at: "revision"; revised: number[]; over: boolean };
+
+/**
+ * Where the lesson stands, for a Ceeq who has just been connected in the
+ * middle of it. Her own last words are put to her straight after this note.
+ * `spoken` says whether she had said anything to the student yet.
+ */
+export function carryOverNote(module: ModulePlan, progress: ModuleProgress | undefined, stage: Stage, spoken: boolean): string {
+  const joined = "The line dropped for a moment and you are connected again. Do not greet the student again and do not mention the break.";
+  const last = spoken ? "The last thing you said to the student follows this note." : "You have not said anything to the student yet.";
+  const quiet = "Say nothing more now. If the student asks you something, answer it briefly.";
+  if (stage.at === "revision") {
+    if (stage.over) return `(${joined} The student has finished revising this module with you and can see how it went. ${last} ${quiet} ${PACE_REMINDER})`;
+    const dealtWith = stage.revised.length ? ` Already dealt with: goal ${stage.revised.join(", goal ")}.` : "";
+    return `(${joined} The student is revising this module with you.${dealtWith} ${last}${spoken ? " Wait for their answer to it and judge it as usual, then carry on down your revision list." : ""} ${PACE_REMINDER})`;
+  }
+  if (stage.at === "quiz") {
+    return stage.report
+      ? `(${joined} You are in part 3: the student has taken the quiz. ${stage.report} ${last} ${quiet} Do not start teaching another module. ${PACE_REMINDER})`
+      : `(${joined} You are in part 3: the module has been explained and practised, and the student is taking the quiz on their screen. ${last} Stay silent until you are told the result. ${PACE_REMINDER})`;
+  }
+  const goals = module.goals.map((g, i) => `${i + 1}. ${g} — ${progress?.goals[i] ?? "todo"}`).join("; ");
+  return stage.at === "explain"
+    ? `(${joined} You are in part 1, explaining this module. Goal status: ${goals}. Goals marked "learning" have been explained, except perhaps the last of them, which you were in the middle of. ${last} Say nothing more until you are asked to carry on. ${PACE_REMINDER})`
+    : `(${joined} You are in part 2, practising with the student; the whole module has been explained. Goal status: ${goals}. ${last}${spoken ? " Wait for their answer to it and judge it as usual." : ""} ${PACE_REMINDER})`;
+}
+
+// What is asked of Ceeq on a new connection when something was waiting on her
+// as the old one was lost, outside the explanation (where it is CARRY_ON).
+
+/** In practice or a revision. */
+export const GO_ON = "(Go on from where you were: tools first, then speak.)";
+/** The quiz had just been put on the student's screen. */
+export const QUIZ_SHOWN = "(The quiz is now on the student's screen. Wish them luck in one short sentence, then stay silent until you are told the result.)";
+/** The last topic of a revision had just been settled. */
+export const REVISION_OVER = "(The revision is finished and the student can see how it went. Say in two sentences what they did well, say goodbye, and stop.)";
+
+/** How the student did in the quiz, as Ceeq is told it. */
+export function quizReport(score: number, total: number, missed: string[]): string {
+  return `Quiz result: ${score} out of ${total}. ${missed.length ? `Questions they missed: ${missed.map((q) => `"${q}"`).join("; ")}.` : "They missed nothing."}`;
+}
+
+/** Sent when the student finishes the quiz, and again if Ceeq says nothing to it. */
+export function quizResultPrompt(report: string): string {
+  return `(${report} Respond as instructed for a quiz result.)`;
+}
+
+/** How many times in a row a connection is replaced without Ceeq managing a turn before the lesson is paused instead. */
+export const MAX_RECONNECTS = 3;
+
 /**
  * The goal an answer is about when Ceeq does not say. She works through the
  * goals in `order`, so it is the first one she has not yet settled (marked
@@ -130,12 +193,29 @@ export function carryOnLimit(goalCount: number): number {
 }
 
 /**
+ * Sent when a reply was due from Ceeq and none came: the voice service
+ * sometimes returns an empty turn, or calls a tool and then says nothing.
+ */
+export const SPEAK_UP = "(Nothing was heard from you. Say your reply to the student now: tools first, then speak.)";
+
+/** How many empty turns in a row are answered with SPEAK_UP before the app stops asking. */
+export const MAX_SILENT_TURNS = 3;
+
+/**
  * Once prompted, Ceeq takes a second or two to start speaking. So she is
  * prompted this long before the paragraph she is on finishes playing, and the
- * next one follows after a breath instead of a silence. (Only possible when the
- * audio is slowed: at normal pace nothing is left to play when a turn completes.)
+ * next one follows after a breath instead of a silence. Her speech arrives
+ * several times faster than it is spoken, so there is always time to do this.
  */
 export const LEAD_MS = 1500;
+/**
+ * A prompt to carry on is held back while the mic hears a voice, so that a
+ * question asked between two paragraphs is heard out and answered instead of
+ * being talked over. It is looked at again this often, for at most this long:
+ * a room that is simply loud must not hold the lesson up.
+ */
+export const HOLD_STEP_MS = 300;
+export const MAX_HOLD_MS = 6000;
 /** After she has answered the student, wait longer so they can follow up. */
 export const GAP_AFTER_STUDENT_MS = 2500;
 /** If nothing at all happens for this long while she should be explaining, prompt her anyway. */
