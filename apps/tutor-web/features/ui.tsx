@@ -64,7 +64,7 @@ export function ProgressRing({ value, size = 28 }: { value: number; size?: numbe
   );
 }
 
-export function Icon({ name, className = "h-5 w-5" }: { name: "back" | "mic" | "mic-off" | "send" | "chevron" | "check" | "stop" | "pause" | "play"; className?: string }) {
+export function Icon({ name, className = "h-5 w-5" }: { name: "back" | "mic" | "mic-off" | "send" | "chevron" | "check" | "stop" | "pause" | "play" | "user"; className?: string }) {
   const paths: Record<typeof name, ReactNode> = {
     back: <path d="M15 18l-6-6 6-6" />,
     chevron: <path d="M9 18l6-6-6-6" />,
@@ -73,6 +73,12 @@ export function Icon({ name, className = "h-5 w-5" }: { name: "back" | "mic" | "
     stop: <rect x="6" y="6" width="12" height="12" rx="2" />,
     pause: <path d="M9 5v14M15 5v14" />,
     play: <path d="M8 5l11 7-11 7z" />,
+    user: (
+      <>
+        <circle cx="12" cy="8" r="4" />
+        <path d="M4 21a8 8 0 0116 0" />
+      </>
+    ),
     mic: (
       <>
         <rect x="9" y="3" width="6" height="11" rx="3" />

@@ -11,6 +11,7 @@ export default async function Page({ params, searchParams }: PageProps<"/learn/[
       moduleId={decodeURIComponent(moduleId)}
       custom={customChapter(subjectId, query)}
       startWithQuiz={query.quiz === "1"}
+      revise={query.revise === "1"}
     />
   );
 }

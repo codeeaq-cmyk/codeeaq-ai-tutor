@@ -14,11 +14,14 @@ import {
   type Subject,
   type Syllabus,
 } from "@codeeaq/shared-types";
+import { AccountMenu } from "@/features/auth/AccountMenu";
 import { Icon, PrimaryButton, ProgressRing, Wordmark } from "@/features/ui";
 import { classKey, useProfile } from "@/lib/profile";
 import { chapterKey, useAllProgress } from "@/lib/progress";
-import { useHydrated } from "@/lib/storage";
+import { modulesToRevise } from "@/lib/revise";
+import { useHydrated, useNow } from "@/lib/storage";
 import { useSyllabus } from "@/lib/syllabus";
+import { ToRevise } from "./ToRevise";
 
 export function LearnScreen() {
   const router = useRouter();
@@ -41,9 +44,12 @@ function Learn({ profile }: { profile: StudentProfile }) {
     <main className="mx-auto w-full max-w-3xl px-5 pb-16">
       <header className="flex items-center justify-between py-5">
         <Wordmark />
-        <Link href="/?edit=1" className="rounded-xl border border-line bg-surface px-3 py-1.5 text-sm hover:border-muted">
-          {summary} <span className="text-muted">· {languageName(profile.language)}</span>
-        </Link>
+        <div className="flex items-center gap-2">
+          <Link href="/?edit=1" className="rounded-xl border border-line bg-surface px-3 py-1.5 text-sm hover:border-muted">
+            {summary} <span className="text-muted">· {languageName(profile.language)}</span>
+          </Link>
+          <AccountMenu />
+        </div>
       </header>
 
       {state.status === "loading" && <LoadingSyllabus summary={summary} />}
@@ -83,6 +89,9 @@ function LoadingSyllabus({ summary }: { summary: string }) {
 function Subjects({ profile, syllabus }: { profile: StudentProfile; syllabus: Syllabus }) {
   const cls = classKey(profile);
   const progress = useAllProgress();
+  const now = useNow();
+  // What slipped in practice or a quiz, across every subject: the student's reminder to revise.
+  const toRevise = useMemo(() => modulesToRevise(progress, cls, syllabus, now), [progress, cls, syllabus, now]);
   const [subjectId, setSubjectId] = useState(syllabus.subjects[0]?.id);
   const subject = syllabus.subjects.find((s) => s.id === subjectId) ?? syllabus.subjects[0];
 
@@ -115,10 +124,11 @@ function Subjects({ profile, syllabus }: { profile: StudentProfile; syllabus: Sy
 
   return (
     <>
+      <ToRevise modules={toRevise} now={now} />
       {resume && (
         <Link
           href={`/learn/${resume.subject.id}/${resume.chapterId}`}
-          className="mt-2 flex items-center gap-4 rounded-2xl bg-accent p-4 text-accent-fg shadow-sm transition-opacity hover:opacity-95"
+          className="mt-3 flex items-center gap-4 rounded-2xl bg-accent p-4 text-accent-fg shadow-sm transition-opacity hover:opacity-95"
         >
           <div className="min-w-0 flex-1">
             <div className="text-sm opacity-80">Continue · {resume.subject.name}</div>

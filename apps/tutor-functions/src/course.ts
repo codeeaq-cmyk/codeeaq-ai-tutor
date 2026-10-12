@@ -49,11 +49,12 @@ Rules:
 - Cover different goals. Mix question styles: concept, worked calculation or example, and one applied or real-life question.
 - Exactly 4 options each, one clearly correct. Wrong options should reflect common mistakes. No "all of the above" or "none of the above".
 - "answer" is the index (0 to 3) of the correct option.
+- "goal" is the number of the goal above that the question mainly tests.
 - "explanation": one or two sentences on why the answer is right, written to the student.
 - Write maths between $...$ in LaTeX (e.g. $\\\\frac{1}{2}$, $x^2$). Keep everything else plain text.
 ${avoid.length ? `- Do not repeat or closely rephrase these earlier questions:\n${avoid.join('\n')}\n` : ''}
 Reply with JSON only, in exactly this shape:
-{"questions": [{"question": "<text>", "options": ["<a>", "<b>", "<c>", "<d>"], "answer": 0, "explanation": "<text>"}]}`;
+{"questions": [{"question": "<text>", "options": ["<a>", "<b>", "<c>", "<d>"], "answer": 0, "explanation": "<text>", "goal": 1}]}`;
 }
 
 export function parseQuizReply(text: string, random: () => number = Math.random): QuizQuestion[] {

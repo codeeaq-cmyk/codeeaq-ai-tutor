@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { QUIZ_PASS_SHARE, type QuizQuestion } from "@codeeaq/shared-types";
+import { QUIZ_PASS_SHARE, type QuizAnswer, type QuizQuestion } from "@codeeaq/shared-types";
 import { MathText } from "@/features/board/MathText";
 import { Icon, PrimaryButton, ProgressRing } from "@/features/ui";
 
@@ -11,6 +11,8 @@ export interface QuizResult {
   total: number;
   /** Questions answered wrongly, for Ceeq's feedback. */
   missed: string[];
+  /** Every answer with the goal its question tested, for tracking what to revise. */
+  answers: QuizAnswer[];
 }
 
 interface Props {
@@ -21,6 +23,8 @@ interface Props {
   onRevisitLesson: () => void;
   /** Where to go next after the quiz: the next module, or back to the chapter. */
   next: { href: string; label: string };
+  /** Set when the module has topics to revise: a link to go over them with Ceeq. */
+  revise?: { href: string; count: number };
 }
 
 type Phase =
@@ -31,7 +35,7 @@ type Phase =
 
 const LETTERS = ["A", "B", "C", "D"];
 
-export function QuizView({ moduleTitle, load, onFinished, onRevisitLesson, next }: Props) {
+export function QuizView({ moduleTitle, load, onFinished, onRevisitLesson, next, revise }: Props) {
   const [phase, setPhase] = useState<Phase>({ name: "loading" });
   const loadRef = useRef(load);
   const finishedRef = useRef(onFinished);
@@ -75,9 +79,10 @@ export function QuizView({ moduleTitle, load, onFinished, onRevisitLesson, next 
       setPhase({ ...phase, index: index + 1 });
       return;
     }
-    const missed = questions.filter((q, i) => picks[i] !== q.answer).map((q) => q.question);
+    const answers = questions.map((q, i) => ({ question: q.question, goal: q.goal, correct: picks[i] === q.answer }));
+    const missed = answers.filter((a) => !a.correct).map((a) => a.question);
     setPhase({ name: "done", questions, picks });
-    finishedRef.current({ score: questions.length - missed.length, total: questions.length, missed });
+    finishedRef.current({ score: questions.length - missed.length, total: questions.length, missed, answers });
   }, [phase]);
 
   // Keyboard: 1–4 or A–D to answer, Enter to continue.
@@ -163,6 +168,23 @@ export function QuizView({ moduleTitle, load, onFinished, onRevisitLesson, next 
             </Link>
           )}
         </div>
+
+        {revise && (
+          <Link
+            href={revise.href}
+            className="mt-6 flex items-center gap-4 rounded-2xl border border-line bg-surface p-4 transition-colors hover:border-(--ink-amber)"
+          >
+            <span className="h-2.5 w-2.5 shrink-0 rounded-full bg-(--ink-amber)" aria-hidden />
+            <span className="min-w-0 flex-1">
+              <span className="block font-semibold">
+                {revise.count === 1 ? "1 topic to go over" : `${revise.count} topics to go over`}
+              </span>
+              <span className="block text-sm text-muted">Ceeq will teach {revise.count === 1 ? "it" : "them"} again and check you’ve got {revise.count === 1 ? "it" : "them"}.</span>
+            </span>
+            <span className="shrink-0 text-sm font-medium text-accent">Revise now</span>
+            <Icon name="chevron" className="h-4 w-4 shrink-0 text-muted" />
+          </Link>
+        )}
 
         <ol className="mt-8 space-y-4">
           {phase.questions.map((q, i) => {

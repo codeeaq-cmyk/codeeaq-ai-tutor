@@ -5,13 +5,17 @@ import {
   bestAttempt,
   chapterMastery,
   moduleState,
+  weakGoals,
   type ModulePlan,
   type ModuleProgress,
   type ModuleState,
+  type WeakGoal,
 } from "@codeeaq/shared-types";
 import { Icon, ProgressRing } from "@/features/ui";
 import { useChapterPlan } from "@/lib/course";
 import { useChapterProgress } from "@/lib/progress";
+import { dayLabel } from "@/lib/revise";
+import { useNow } from "@/lib/storage";
 import { useChapterTarget, type ChapterRouteProps, type ChapterTarget } from "@/lib/target";
 
 export function ChapterScreen(props: ChapterRouteProps) {
@@ -33,6 +37,7 @@ export function Missing() {
 function Chapter({ target }: { target: ChapterTarget }) {
   const { state, retry } = useChapterPlan(target.key, target.ref);
   const progress = useChapterProgress(target.key);
+  const now = useNow();
 
   const modules = state.status === "ready" ? state.plan.modules : [];
   const provisional = state.status === "ready" && state.provisional;
@@ -87,6 +92,9 @@ function Chapter({ target }: { target: ChapterTarget }) {
                 isNext={i === nextIndex}
                 lessonHref={target.href(module.id)}
                 quizHref={target.href(module.id, { quiz: true })}
+                reviseHref={target.href(module.id, { revise: true })}
+                weak={weakGoals(progress?.modules[module.id], now)}
+                now={now}
               />
             ))}
           </ol>
@@ -116,6 +124,9 @@ function ModuleCard({
   isNext,
   lessonHref,
   quizHref,
+  reviseHref,
+  weak,
+  now,
 }: {
   number: number;
   module: ModulePlan;
@@ -124,9 +135,14 @@ function ModuleCard({
   isNext: boolean;
   lessonHref: string;
   quizHref: string;
+  reviseHref: string;
+  /** The goals the student got wrong and has yet to put right. */
+  weak: WeakGoal[];
+  now: number;
 }) {
   const best = bestAttempt(progress);
   const attempts = progress?.attempts.length ?? 0;
+  const due = weak.filter((g) => g.due).length;
   const primary =
     state === "new"
       ? { href: lessonHref, label: "Start lesson" }
@@ -159,24 +175,42 @@ function ModuleCard({
               {STATE_LABEL[state]}
               {best ? ` · best ${best.score}/${best.total}` : ""}
               {attempts > 1 ? ` · ${attempts} attempts` : ""}
+              {due > 0 && <span className="text-(--ink-amber)"> · {due} to revise</span>}
             </span>
           </div>
           <ul className="mt-2 space-y-1 text-[15px] text-muted">
             {module.goals.map((goal, g) => {
               const status = progress?.goals[g] ?? "todo";
+              const spot = weak.find((w) => w.index === g);
               return (
                 <li key={g} className="flex gap-2">
-                  <span className={`mt-2 h-1.5 w-1.5 shrink-0 rounded-full ${status === "understood" ? "bg-(--ink-green)" : status === "todo" ? "bg-line" : "bg-accent"}`} />
-                  {goal}
+                  <span
+                    className={`mt-2 h-1.5 w-1.5 shrink-0 rounded-full ${
+                      spot?.due ? "bg-(--ink-amber)" : status === "understood" ? "bg-(--ink-green)" : status === "todo" ? "bg-line" : "bg-accent"
+                    }`}
+                  />
+                  <span>
+                    {goal}
+                    {spot && (
+                      <span className={`ml-1.5 text-xs ${spot.due ? "text-(--ink-amber)" : ""}`}>
+                        {spot.due ? "to revise" : `check ${dayLabel(spot.spot.dueAt, now)}`}
+                      </span>
+                    )}
+                  </span>
                 </li>
               );
             })}
           </ul>
           <div className="mt-4 flex flex-wrap items-center gap-2">
+            {due > 0 && (
+              <Link href={reviseHref} className="inline-flex items-center gap-2 rounded-xl bg-accent px-4 py-2 text-sm font-semibold text-accent-fg hover:opacity-90">
+                Revise {due === 1 ? "1 topic" : `${due} topics`}
+              </Link>
+            )}
             <Link
               href={primary.href}
               className={`inline-flex items-center gap-1.5 rounded-xl px-4 py-2 text-sm font-semibold ${
-                isNext || state === "quiz-ready" ? "bg-accent text-accent-fg hover:opacity-90" : "border border-line hover:border-muted"
+                due === 0 && (isNext || state === "quiz-ready") ? "bg-accent text-accent-fg hover:opacity-90" : "border border-line hover:border-muted"
               }`}
             >
               {primary.label}

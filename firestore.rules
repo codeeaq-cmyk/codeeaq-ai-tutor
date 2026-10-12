@@ -1,0 +1,16 @@
+rules_version = '2';
+
+// Each student's record and progress can be read and written only by that
+// student, signed in with their phone number. Nothing else is stored here.
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /students/{uid} {
+      allow read, write: if request.auth != null && request.auth.uid == uid;
+
+      // One document per chapter: its module plan, progress and weak spots.
+      match /chapters/{chapter} {
+        allow read, write: if request.auth != null && request.auth.uid == uid;
+      }
+    }
+  }
+}

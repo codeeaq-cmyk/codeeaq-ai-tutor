@@ -74,6 +74,11 @@ body {
   outline-offset: 2px;
 }
 
+/* For a text box whose own border, or the box around it, already shows focus. */
+.plain-focus:focus-visible {
+  outline: none;
+}
+
 /* New whiteboard blocks write themselves in. */
 @keyframes block-in {
   from {

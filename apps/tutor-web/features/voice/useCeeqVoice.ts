@@ -12,6 +12,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { GoogleGenAI, type LiveServerMessage, type Session } from "@google/genai";
 import type { StartVoiceResponse } from "@codeeaq/shared-types";
+import { SecondTake, type Released } from "./secondTake";
 import { TimeStretcher } from "./timeStretch";
 
 export type VoiceStatus = "idle" | "connecting" | "live" | "paused" | "error";
@@ -41,6 +42,8 @@ const TOKEN_TTL_MS = 8 * 60 * 1000; // tokens are minted for 10 minutes
 const IDLE_PAUSE_MS = 4 * 60 * 1000; // pause after this long without the student
 /** The pause left between one of Ceeq's turns and the next when they follow straight on. */
 const BREATH_SECONDS = 0.7;
+/** Speech held back as a possible second take is let through after this long if nothing settles it. */
+const HOLD_LIMIT_MS = 4000;
 // While Ceeq speaks, mic chunks quieter than this are treated as her own echo.
 const BARGE_IN_RMS = 0.045;
 
@@ -247,10 +250,34 @@ export function useCeeqVoice({ getToken, onToolCall, speed, onTurnEnd, onStudent
 
   const thinkingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  // Guards against Ceeq saying a paragraph twice around a late tool call (see secondTake.ts).
+  const takeRef = useRef<SecondTake<string> | null>(null);
+  const holdTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const getTake = useCallback(() => (takeRef.current ??= new SecondTake<string>()), []);
+  /** Forgets speech that was being held back: the turn it belonged to is over. */
+  const dropHeld = useCallback(() => {
+    if (holdTimerRef.current) clearTimeout(holdTimerRef.current);
+    holdTimerRef.current = null;
+    takeRef.current?.endTurn();
+  }, []);
+  /** Plays and shows whatever the guard has let through. */
+  const letThrough = useCallback(
+    ({ show, play }: Released<string>) => {
+      play.forEach(playChunk);
+      if (show) setCaption((prev) => prev + show);
+      if (!takeRef.current?.holding && holdTimerRef.current) {
+        clearTimeout(holdTimerRef.current);
+        holdTimerRef.current = null;
+      }
+    },
+    [playChunk],
+  );
+
   const handleMessage = useCallback(
     (message: LiveServerMessage) => {
       const calls = message.toolCall?.functionCalls;
       if (calls?.length) {
+        getTake().toolCall();
         const functionResponses = calls.map((call) => {
           let response: Record<string, unknown>;
           try {
@@ -268,6 +295,8 @@ export function useCeeqVoice({ getToken, onToolCall, speed, onTurnEnd, onStudent
       if (!content) return;
 
       if (content.interrupted) {
+        // Whatever was held back belongs to the turn the student has just cut short.
+        dropHeld();
         stopPlayback();
         newTurnRef.current = true;
         interruptedRef.current = true;
@@ -296,13 +325,21 @@ export function useCeeqVoice({ getToken, onToolCall, speed, onTurnEnd, onStudent
           breathRef.current = true;
           setCaption("");
         }
-        playChunk(part.inlineData.data);
+        getTake().audio(part.inlineData.data).forEach(playChunk);
+        if (getTake().holding && !holdTimerRef.current) {
+          // Without a transcript to settle it, held speech must not stay unheard for long.
+          holdTimerRef.current = setTimeout(() => {
+            holdTimerRef.current = null;
+            letThrough(getTake().release());
+          }, HOLD_LIMIT_MS);
+        }
       }
 
       const spokenDelta = content.outputTranscription?.text;
-      if (spokenDelta) setCaption((prev) => prev + spokenDelta);
+      if (spokenDelta) letThrough(getTake().text(spokenDelta));
 
       if (content.turnComplete) {
+        letThrough(getTake().endTurn());
         finishUtterance();
         newTurnRef.current = true;
         setHeard("");
@@ -317,7 +354,7 @@ export function useCeeqVoice({ getToken, onToolCall, speed, onTurnEnd, onStudent
         }
       }
     },
-    [finishUtterance, playChunk, remainingMs, stopPlayback, touch],
+    [dropHeld, finishUtterance, getTake, letThrough, playChunk, remainingMs, stopPlayback, touch],
   );
 
   // ---------- Mic (hands-free) ----------
@@ -389,6 +426,7 @@ export function useCeeqVoice({ getToken, onToolCall, speed, onTurnEnd, onStudent
     generationRef.current++;
     if (idleTimerRef.current) clearTimeout(idleTimerRef.current);
     if (thinkingTimerRef.current) clearTimeout(thinkingTimerRef.current);
+    dropHeld();
     stopMic();
     stopPlayback();
     releasePlayback();
@@ -398,7 +436,7 @@ export function useCeeqVoice({ getToken, onToolCall, speed, onTurnEnd, onStudent
     sessionRef.current = null;
     setActivity("idle");
     setHeard("");
-  }, [releasePlayback, stopMic, stopPlayback]);
+  }, [dropHeld, releasePlayback, stopMic, stopPlayback]);
 
   const pause = useCallback(() => {
     teardown();
@@ -470,6 +508,7 @@ export function useCeeqVoice({ getToken, onToolCall, speed, onTurnEnd, onStudent
       // Typing over Ceeq cuts her off, like speaking over her. If her turn was
       // still under way, its "complete" signal is yet to come and must not count.
       interruptedRef.current = midTurnRef.current;
+      dropHeld();
       stopPlayback();
       newTurnRef.current = true;
       afterStudentRef.current = true;
@@ -480,7 +519,7 @@ export function useCeeqVoice({ getToken, onToolCall, speed, onTurnEnd, onStudent
       touch();
       return true;
     },
-    [stopPlayback, touch],
+    [dropHeld, stopPlayback, touch],
   );
 
   /** Tells Ceeq something from the app (e.g. a quiz result) without showing it as the student's words. */
@@ -504,6 +543,7 @@ export function useCeeqVoice({ getToken, onToolCall, speed, onTurnEnd, onStudent
     () => () => {
       generationRef.current++;
       if (idleTimerRef.current) clearTimeout(idleTimerRef.current);
+      if (holdTimerRef.current) clearTimeout(holdTimerRef.current);
       sessionRef.current?.close();
       micStreamRef.current?.getTracks().forEach((track) => track.stop());
       void micCtxRef.current?.close();

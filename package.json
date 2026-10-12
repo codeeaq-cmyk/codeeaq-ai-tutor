@@ -11,7 +11,8 @@
   "scripts": {
     "build:shared": "npm run build -w @codeeaq/shared-types",
     "dev:web": "npm run dev -w tutor-web",
-    "dev:functions": "npm run build -w tutor-functions && firebase emulators:start --only functions",
+    "dev:backend": "npm run build -w tutor-functions && node scripts/dev-backend.mjs",
+    "dev:functions": "npm run dev:backend",
     "watch:functions": "npm run watch -w tutor-functions",
     "build": "npm run build:shared && npm run build -w tutor-functions && npm run build -w tutor-web",
     "test": "npm run test -w @codeeaq/shared-types && npm run test -w tutor-functions && npm run test -w tutor-web",

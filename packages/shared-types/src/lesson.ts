@@ -1,4 +1,5 @@
 import type { StudentProfile } from './profile.js';
+import type { RevisionTopic, WeakSpot } from './revision.js';
 import { slugify } from './syllabus.js';
 
 // A chapter is taught as a sequence of modules. Each module has a few goals
@@ -72,6 +73,8 @@ export interface QuizQuestion {
   /** Index of the correct option. */
   answer: number;
   explanation: string;
+  /** Number of the module goal the question tests, starting at 1, when known. */
+  goal?: number;
 }
 
 export interface Quiz {
@@ -96,7 +99,7 @@ export function parseQuizQuestions(value: unknown, random?: () => number): QuizQ
   const raw = (value as { questions?: unknown } | null)?.questions;
   if (!Array.isArray(raw)) return [];
   const out: QuizQuestion[] = [];
-  for (const q of raw as { question?: unknown; options?: unknown; answer?: unknown; explanation?: unknown }[]) {
+  for (const q of raw as { question?: unknown; options?: unknown; answer?: unknown; explanation?: unknown; goal?: unknown }[]) {
     const question = line(q?.question, 400);
     const options = Array.isArray(q?.options) ? q.options.map((o) => line(o, 200)) : [];
     const answer = typeof q?.answer === 'number' ? Math.round(q.answer) : -1;
@@ -112,13 +115,14 @@ export function parseQuizQuestions(value: unknown, random?: () => number): QuizQ
       options: order.map((i) => options[i]),
       answer: order.indexOf(answer),
       explanation: line(q.explanation, 400),
+      ...(typeof q.goal === 'number' && Number.isInteger(q.goal) && q.goal >= 1 && q.goal <= MAX_GOALS + 1 ? { goal: q.goal } : {}),
     });
     if (out.length === QUIZ_LENGTH) break;
   }
   return out;
 }
 
-// ---------- Progress (kept on the student's device) ----------
+// ---------- Progress (kept with the student's account) ----------
 
 export type GoalStatus = 'todo' | 'learning' | 'understood' | 'practice';
 
@@ -147,12 +151,16 @@ export interface ModuleProgress {
   correct: number;
   incorrect: number;
   mistakes: string[];
+  /** One entry per goal: what the student still has to revise, or null. See revision.ts. */
+  weak: (WeakSpot | null)[];
 }
 
 export interface ChapterProgress {
   plan: ChapterPlan;
   modules: Record<string, ModuleProgress>;
   updatedAt: number;
+  /** What the chapter is called, so it can be listed away from its own page. */
+  names?: { subject: string; chapter: string };
 }
 
 export function emptyModuleProgress(goalCount: number): ModuleProgress {
@@ -164,6 +172,7 @@ export function emptyModuleProgress(goalCount: number): ModuleProgress {
     correct: 0,
     incorrect: 0,
     mistakes: [],
+    weak: Array.from({ length: goalCount }, () => null),
   };
 }
 
@@ -197,6 +206,8 @@ export interface StartVoiceRequest extends ChapterRef {
   module: { title: string; goals: string[] };
   /** Titles of every module in the chapter, in order, so Ceeq knows what is taught elsewhere. */
   chapterModules: string[];
+  /** Set for a revision lesson: the weak spots to go over, instead of teaching the whole module. */
+  revise?: RevisionTopic[];
 }
 
 export interface StartVoiceResponse {
@@ -223,17 +234,19 @@ export const PROGRESS_TOOL = {
 
 export const ANSWER_TOOL = {
   name: 'record_answer',
-  description: "Record the student's answer to a question you asked. Call right after judging each answer.",
+  description:
+    'Record the student\'s answer to a question you asked. Call right after judging each real attempt at an answer. Do not call it when the student only says "yes" or "okay", or asks a question of their own.',
   parametersJsonSchema: {
     type: 'object',
     properties: {
+      goal: { type: 'integer', description: 'Number of the goal your question was about, starting at 1.' },
       correct: { type: 'boolean' },
       mistake: {
         type: 'string',
         description: 'If incorrect: the misconception in a few words, e.g. "confused numerator and denominator".',
       },
     },
-    required: ['correct'],
+    required: ['goal', 'correct'],
   },
 };
 
@@ -251,6 +264,13 @@ export const FINISH_MODULE_TOOL = {
   parametersJsonSchema: { type: 'object', properties: {} },
 };
 
+export const FINISH_REVISION_TOOL = {
+  name: 'finish_revision',
+  description:
+    'Call once, at the start of the turn in which you close a revision lesson, after every topic on your revision list has been dealt with. The app then shows the student how the revision went.',
+  parametersJsonSchema: { type: 'object', properties: {} },
+};
+
 // ---------- Tool argument validation ----------
 
 export function parseProgressUpdate(args: unknown, goalCount: number): { index: number; status: GoalStatus } | null {
@@ -260,9 +280,15 @@ export function parseProgressUpdate(args: unknown, goalCount: number): { index: 
   return index >= 0 && index < goalCount && status ? { index, status } : null;
 }
 
-export function parseAnswer(args: unknown): { correct: boolean; mistake?: string } | null {
-  const a = args as { correct?: unknown; mistake?: unknown } | null;
+/** `index` is the goal the answer was about, when Ceeq named a valid one. */
+export function parseAnswer(args: unknown, goalCount: number): { correct: boolean; mistake?: string; index?: number } | null {
+  const a = args as { correct?: unknown; mistake?: unknown; goal?: unknown } | null;
   if (typeof a?.correct !== 'boolean') return null;
   const mistake = typeof a.mistake === 'string' ? a.mistake.trim().slice(0, 80) : '';
-  return a.correct || !mistake ? { correct: a.correct } : { correct: false, mistake };
+  const index = typeof a.goal === 'number' ? Math.round(a.goal) - 1 : -1;
+  return {
+    correct: a.correct,
+    ...(!a.correct && mistake ? { mistake } : {}),
+    ...(index >= 0 && index < goalCount ? { index } : {}),
+  };
 }

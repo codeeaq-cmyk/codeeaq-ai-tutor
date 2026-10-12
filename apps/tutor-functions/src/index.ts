@@ -1,9 +1,10 @@
 import { logger, setGlobalOptions } from 'firebase-functions';
-import { HttpsError, onCall } from 'firebase-functions/v2/https';
+import { HttpsError, onCall, type CallableRequest } from 'firebase-functions/v2/https';
 import { defineSecret, defineString } from 'firebase-functions/params';
 import {
   FUNCTIONS_REGION,
   parseProfile,
+  parseRevisionTopics,
   type ChapterPlan,
   type ChapterRef,
   type GetChapterPlanRequest,
@@ -21,7 +22,8 @@ import { cachedSyllabus, generateSyllabus } from './syllabus/generate';
 import { mintVoiceToken } from './voice';
 
 // Called straight from students' browsers, so the endpoints must be publicly invokable.
-// Each function validates its own input; abuse limits (App Check, rate limiting) are still to add.
+// Each function then insists on a signed-in student and validates its own input;
+// abuse limits (App Check, rate limiting per student) are still to add.
 setGlobalOptions({ region: FUNCTIONS_REGION, maxInstances: 10, invoker: 'public' });
 
 const geminiApiKey = defineSecret('GEMINI_API_KEY');
@@ -35,6 +37,13 @@ const courseModels = defineString('GEMINI_COURSE_MODELS', {
 });
 const liveModel = defineString('GEMINI_LIVE_MODEL', { default: 'models/gemini-3.1-flash-live-preview' });
 const voiceName = defineString('GEMINI_VOICE', { default: 'Sulafat' });
+
+/** Every call must come from a student who has signed in with their phone number. */
+function requireStudent(request: CallableRequest<unknown>): string {
+  const uid = request.auth?.uid;
+  if (!uid) throw new HttpsError('unauthenticated', 'Please sign in to continue.');
+  return uid;
+}
 
 function requireKey(): string {
   const key = geminiApiKey.value();
@@ -96,6 +105,7 @@ function moduleRef(data: { module?: { title?: unknown; goals?: unknown } } | und
 export const getSyllabus = onCall<GetSyllabusRequest, Promise<Syllabus>>(
   { secrets: [geminiApiKey], timeoutSeconds: 120, memory: '512MiB' },
   async (request) => {
+    requireStudent(request);
     // The profile parser validates board, class and stream; language is irrelevant here.
     const profile = parseProfile({ ...(request.data ?? {}), language: 'en' });
     if (!profile) throw new HttpsError('invalid-argument', 'A valid board, class and stream are required');
@@ -118,6 +128,7 @@ export const getSyllabus = onCall<GetSyllabusRequest, Promise<Syllabus>>(
 export const getChapterPlan = onCall<GetChapterPlanRequest, Promise<ChapterPlan>>(
   { secrets: [geminiApiKey], timeoutSeconds: 90 },
   async (request) => {
+    requireStudent(request);
     const ref = chapterRef(request.data);
     try {
       return await generateChapterPlan(getCourseAsker(), ref);
@@ -133,6 +144,7 @@ export const getChapterPlan = onCall<GetChapterPlanRequest, Promise<ChapterPlan>
 export const getQuiz = onCall<GetQuizRequest, Promise<Quiz>>(
   { secrets: [geminiApiKey], timeoutSeconds: 90 },
   async (request) => {
+    requireStudent(request);
     const ref = chapterRef(request.data);
     const module = moduleRef(request.data);
     const avoid = request.data.avoid === undefined ? [] : texts(request.data.avoid, 30, 400);
@@ -148,19 +160,22 @@ export const getQuiz = onCall<GetQuizRequest, Promise<Quiz>>(
   },
 );
 
-/** Mints a one-use Gemini Live token for one module's lesson. */
+/** Mints a one-use Gemini Live token for one module's lesson, or for a revision of its weak spots. */
 export const createVoiceSession = onCall<StartVoiceRequest, Promise<StartVoiceResponse>>(
   { secrets: [geminiApiKey], timeoutSeconds: 30 },
   async (request) => {
+    requireStudent(request);
     const ref = chapterRef(request.data);
     const module = moduleRef(request.data);
     const chapterModules = texts(request.data.chapterModules, 10, 100);
     if (!chapterModules) throw new HttpsError('invalid-argument', 'chapterModules must be a list of titles');
+    const revise = request.data.revise === undefined ? undefined : parseRevisionTopics(request.data.revise, module.goals.length);
+    if (revise === null) throw new HttpsError('invalid-argument', 'revise must list goals of this module');
 
     const key = requireKey();
     const model = liveModel.value();
     try {
-      const token = await mintVoiceToken(key, model, voiceName.value(), { ...ref, module, chapterModules });
+      const token = await mintVoiceToken(key, model, voiceName.value(), { ...ref, module, chapterModules, ...(revise ? { revise } : {}) });
       return { token, model };
     } catch (err) {
       logger.error('Gemini voice token mint failed', { model, err: String(err) });

@@ -14,6 +14,7 @@ import {
   type LanguageId,
   type StreamId,
 } from "@codeeaq/shared-types";
+import { AccountMenu } from "@/features/auth/AccountMenu";
 import { Chip, PrimaryButton, Wordmark } from "@/features/ui";
 import { saveProfile, useProfile } from "@/lib/profile";
 import { useHydrated } from "@/lib/storage";
@@ -48,7 +49,10 @@ function SetupForm({
 
   return (
     <main className="mx-auto flex min-h-screen w-full max-w-2xl flex-col px-5 py-6 sm:py-10">
-      <Wordmark href="/" />
+      <header className="flex items-center justify-between">
+        <Wordmark href="/" />
+        <AccountMenu />
+      </header>
       <div className="mt-10 sm:mt-16">
         <h1 className="text-3xl font-semibold tracking-tight sm:text-4xl">Learn every chapter, out loud.</h1>
         <p className="mt-2 text-lg text-muted">Tell Ceeq what you study. Your whole syllabus appears, ready to learn.</p>

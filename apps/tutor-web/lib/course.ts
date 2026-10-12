@@ -9,7 +9,7 @@ import {
 } from "@codeeaq/shared-types";
 import { fetchChapterPlan, fetchQuiz } from "./firebase";
 import { savePlan, useChapterProgress } from "./progress";
-import { readJson, writeJson } from "./storage";
+import { readJson, studentKey, writeJson } from "./storage";
 
 // ---------- Chapter plan ----------
 
@@ -26,7 +26,9 @@ const FALLBACK_ID = fallbackChapterPlan("").modules[0].id;
  * later visits are instant and module ids stay stable.
  */
 export function useChapterPlan(key: string | undefined, ref: ChapterRef | undefined) {
-  const stored = useChapterProgress(key ?? "")?.plan;
+  const chapter = useChapterProgress(key ?? "");
+  const stored = chapter?.plan;
+  const named = !!chapter?.names;
   // A stored single-lesson fallback (kept so progress can be saved) is retried once per visit.
   const storedIsFallback = stored?.modules[0]?.id === FALLBACK_ID;
   const [failed, setFailed] = useState(false);
@@ -46,7 +48,7 @@ export function useChapterPlan(key: string | undefined, ref: ChapterRef | undefi
     }
     // Not cancelled on cleanup: the result is saved to storage for whoever views the chapter next.
     request
-      .then((plan) => savePlan(key, plan))
+      .then((plan) => savePlan(key, plan, { subject: ref.subject, chapter: ref.chapter }))
       .catch((err: unknown) => {
         console.warn("Chapter plan failed:", err);
         setFailed(true);
@@ -54,6 +56,13 @@ export function useChapterPlan(key: string | undefined, ref: ChapterRef | undefi
     // `ref` is rebuilt each render; the key identifies the chapter.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [key, stored, storedIsFallback, attempt]);
+
+  // Chapters stored before their names were kept get them on the next visit,
+  // so their weak spots can be listed on the home page.
+  useEffect(() => {
+    if (key && ref && stored && !named) savePlan(key, stored, { subject: ref.subject, chapter: ref.chapter });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [key, stored, named]);
 
   const retry = useCallback(() => {
     setFailed(false);
@@ -77,7 +86,8 @@ interface StoredQuiz {
 }
 
 const MAX_SEEN = 30;
-const quizStorageKey = (chapterKey: string, moduleId: string) => `ceeq:quiz:v1:${chapterKey}/${moduleId}`;
+// v2: questions say which goal they test, so a missed one can be revised.
+const quizStorageKey = (chapterKey: string, moduleId: string) => studentKey(`quiz:v2:${chapterKey}/${moduleId}`);
 
 function readStoredQuiz(chapterKey: string, moduleId: string): StoredQuiz | undefined {
   const stored = readJson<StoredQuiz>(quizStorageKey(chapterKey, moduleId));

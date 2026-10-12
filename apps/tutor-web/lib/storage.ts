@@ -1,9 +1,26 @@
-import { useMemo, useSyncExternalStore } from "react";
+import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
 
 // Device storage. Every access is guarded: storage can be unavailable
 // (private mode, blocked site data) and the app must still work.
+//
+// A student's own data (class, progress, quizzes) is kept under keys that
+// carry their account id, so two students sharing a device never see each
+// other's work. It is also saved to their account (see sync.ts); this copy is
+// what makes the app instant and lets it work through a dropped connection.
 
 const listeners = new Set<() => void>();
+
+let studentId: string | null = null;
+
+/** Called when a student signs in or out, before anything reads their data. */
+export function setStorageStudent(uid: string | null): void {
+  studentId = uid;
+}
+
+/** The storage key for something that belongs to the signed-in student. */
+export function studentKey(name: string): string {
+  return `ceeq:${studentId ?? "guest"}:${name}`;
+}
 
 export function readJson<T>(key: string): T | undefined {
   try {
@@ -71,4 +88,17 @@ export function useHydrated(): boolean {
     () => true,
     () => false,
   );
+}
+
+/** The time, for deciding what is due. Steady between renders; brought up to date when the tab is looked at again. */
+export function useNow(): number {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const refresh = () => {
+      if (document.visibilityState === "visible") setNow(Date.now());
+    };
+    document.addEventListener("visibilitychange", refresh);
+    return () => document.removeEventListener("visibilitychange", refresh);
+  }, []);
+  return now;
 }

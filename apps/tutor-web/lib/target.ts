@@ -3,6 +3,7 @@ import { useRouter } from "next/navigation";
 import type { ChapterRef, StudentProfile } from "@codeeaq/shared-types";
 import { classKey, useProfile } from "./profile";
 import { chapterKey } from "./progress";
+import { chapterHref, type LessonLinkOptions } from "./route";
 import { useHydrated } from "./storage";
 import { findChapter, useSyllabus } from "./syllabus";
 
@@ -26,7 +27,7 @@ export interface ChapterTarget {
   /** What the backend needs to know about the chapter. */
   ref: ChapterRef;
   /** Link to the chapter page, or to one of its modules. */
-  href: (moduleId?: string, options?: { quiz?: boolean }) => string;
+  href: (moduleId?: string, options?: LessonLinkOptions) => string;
 }
 
 export type TargetState = { status: "loading" } | { status: "missing" } | { status: "ready"; target: ChapterTarget };
@@ -57,8 +58,6 @@ export function useChapterTarget({ subjectId, chapterId, custom }: ChapterRouteP
       names = { subject: found.subject.name, chapter: found.chapter.title, unit: found.chapter.unit };
     }
 
-    const query = custom ? new URLSearchParams(custom) : new URLSearchParams();
-    const base = `/learn/${encodeURIComponent(ids.subjectId)}/${encodeURIComponent(ids.chapterId)}`;
     return {
       status: "ready",
       target: {
@@ -67,12 +66,7 @@ export function useChapterTarget({ subjectId, chapterId, custom }: ChapterRouteP
         ...ids,
         key: chapterKey(classKey(profile), ids.subjectId, ids.chapterId),
         ref: { profile, subject: names.subject, chapter: names.chapter, ...(names.unit ? { unit: names.unit } : {}) },
-        href: (moduleId, options) => {
-          const q = new URLSearchParams(query);
-          if (options?.quiz) q.set("quiz", "1");
-          const qs = q.toString();
-          return `${base}${moduleId ? `/${encodeURIComponent(moduleId)}` : ""}${qs ? `?${qs}` : ""}`;
-        },
+        href: (moduleId, options) => chapterHref(ids, custom, moduleId, options),
       },
     };
   }, [profile, custom, subjectId, chapterId, state]);

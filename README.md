@@ -2,41 +2,51 @@
 
 ## Getting Started
 
-Requirements: Node.js 22+ (`nvm use` reads `.nvmrc`) and a Gemini API key. No Docker needed yet.
+Requirements: Node.js 22+ (`nvm use` reads `.nvmrc`), a Gemini API key, and Java 21+ for the local database emulator. No Docker needed yet.
 
 ```bash
 npm install              # also builds packages/shared-types
 cp apps/tutor-functions/.secret.local.example apps/tutor-functions/.secret.local   # then set GEMINI_API_KEY
-npm run dev:functions    # Firebase emulator: functions on :5001, emulator UI on http://localhost:4000
+npm run dev:backend      # Firebase emulators: functions :5001, sign-in :9099, database :8080, UI on http://localhost:4000
 npm run dev:web          # Next.js app on http://localhost:3000
 ```
 
-The project ID `demo-ceeq` (`.firebaserc`) is emulator-only, so no Firebase account is needed to develop. While editing functions, run `npm run watch:functions` alongside the emulator so it reloads. For deployed functions, set the key with `npx firebase functions:secrets:set GEMINI_API_KEY`. Models and voice can be overridden in `apps/tutor-functions/.env` (see `.env.example`).
+The project ID `demo-ceeq` (`.firebaserc`) is emulator-only, so no Firebase account is needed to develop. While editing functions, run `npm run watch:functions` alongside the emulators so they reload. For deployed functions, set the key with `npx firebase functions:secrets:set GEMINI_API_KEY`. Models and voice can be overridden in `apps/tutor-functions/.env` (see `.env.example`).
 
-Other scripts: `npm test` (shared-types and functions tests), `npm run build`.
+Signing in locally works with any mobile number: the emulator makes up a code and the sign-in page shows it. Accounts and progress in the emulators last until they are stopped. If the machine's default Java is older than 21, `dev:backend` uses a newer one it finds (Android Studio ships one) for that run only; set `CEEQ_JAVA_HOME` to choose one.
+
+Other scripts: `npm test` (all three workspaces), `npm run build`.
+
+Going live also needs, once per Firebase project: Authentication with the Phone provider switched on and the site's domain added to its authorised domains; a Firestore database (`asia-south1`); and `npx firebase deploy --only firestore:rules,functions --project prod`.
+
+Sign-in is by invitation for now, so that no text is sent (Firebase bills each one, $0.07 to India). Each student is added in the Firebase console under Authentication > Sign-in method > Phone > Phone numbers for testing, as their number and a 6-digit code of your choosing, and is told that code. Firebase allows ten such numbers. The SMS region policy (Authentication > Settings) must allow no region, which is the default for a new project: any other number is then refused instead of being texted. To turn texted codes on later, allow India there and bring back a "send again" link on the sign-in page.
 
 | Path | Contents |
 |---|---|
-| `apps/tutor-web` | Next.js app: setup (board, class, stream, language), syllabus, chapter page with modules, live lesson with whiteboard, quizzes |
-| `apps/tutor-functions` | Cloud Functions `getSyllabus`, `getChapterPlan` (chapter → modules), `getQuiz` (module quiz) and `createVoiceSession` (locked Gemini Live token per module) |
-| `packages/shared-types` | Profile, syllabus, chapter plan, quiz and progress types; whiteboard blocks and validator; lesson tools |
+| `apps/tutor-web` | Next.js app: phone sign-in, setup (board, class, stream, language), syllabus with revision reminders, chapter page with modules, live lesson and revision lesson with whiteboard, quizzes |
+| `apps/tutor-functions` | Cloud Functions `getSyllabus`, `getChapterPlan` (chapter → modules), `getQuiz` (module quiz) and `createVoiceSession` (locked Gemini Live token for a module's lesson or revision). All require a signed-in student |
+| `packages/shared-types` | Profile, syllabus, chapter plan, quiz and progress types; weak spots and revision; whiteboard blocks and validator; lesson tools |
+| `firestore.rules` | Each student can read and write only their own record and progress |
 | `database/migrations` | Future Postgres schema (not used yet) |
 
 ### How it works
 
-1. **Setup.** The student picks board, class, stream (11–12) and the language Ceeq speaks. Stored on the device.
-2. **Syllabus.** `getSyllabus` returns every subject and chapter. Curated syllabi (`apps/tutor-functions/src/syllabus/curated.ts`, currently CBSE Class 10) load instantly. Any other board and class is compiled by Gemini, cached on the server and on the device. The student can also type any subject and chapter.
-3. **Modules.** Opening a chapter calls `getChapterPlan`, which splits it into 3–6 modules, each with a few learning goals. The plan is stored with the chapter's progress, so later visits are instant. If planning fails, the chapter is offered as a single lesson.
-4. **Lesson.** Opening a module mints a one-use Gemini Live token with the module, its goals, the class and the teaching method locked into the instructions (`apps/tutor-functions/src/voice.ts`). The browser streams audio straight to Gemini: hands-free, interruptible, first sound typically under a second.
+1. **Sign-in.** A student signs in with their mobile number and the 6-digit code registered with it (Firebase phone sign-in, `apps/tutor-web/lib/account.ts`). For now the code is given to them rather than texted; see above. There is no separate sign-up: the first time a number is verified, its account is created. Every page and every Cloud Function requires a signed-in student.
+2. **Setup.** The student picks board, class, stream (11–12) and the language Ceeq speaks. Stored with their account.
+3. **Syllabus.** `getSyllabus` returns every subject and chapter. Curated syllabi (`apps/tutor-functions/src/syllabus/curated.ts`, currently CBSE Class 10) load instantly. Any other board and class is compiled by Gemini, cached on the server and on the device. The student can also type any subject and chapter.
+4. **Modules.** Opening a chapter calls `getChapterPlan`, which splits it into 3–6 modules, each with a few learning goals. The plan is stored with the chapter's progress, so later visits are instant. If planning fails, the chapter is offered as a single lesson.
+5. **Lesson.** Opening a module mints a one-use Gemini Live token with the module, its goals, the class and the teaching method locked into the instructions (`apps/tutor-functions/src/voice.ts`). The browser streams audio straight to Gemini: hands-free, interruptible, first sound typically under a second.
    A lesson has three parts. **Explain:** Ceeq opens with what the student will learn and why it matters, then teaches every goal in short spoken paragraphs with the board, building each idea rather than reciting it. The voice model only speaks when prompted, so while she explains the app prompts her to carry on just before each paragraph finishes (`apps/tutor-web/features/lesson/lessonFlow.ts`); the student only listens, and can interrupt with a question or pause at any time. **Practise:** she calls `start_practice`, and from then on the app waits for the student after each question. **Quiz:** she calls `finish_module`.
    The voice model speaks at about 155 words a minute and has no speed setting, so the browser stretches its audio in time without changing pitch (`apps/tutor-web/features/voice/timeStretch.ts`); the student picks Slower, Slow (default) or Normal.
-5. **Tools, not free rein.** Ceeq acts only through four tools, all validated in the browser before anything changes: `whiteboard` (self-laying-out blocks: real images, text with inline maths, formulas incl. chemistry, lists, tables, graphs, number lines, diagrams), `update_progress`, `record_answer`, `start_practice` and `finish_module`. Tool calls come before speech in a turn: called mid-sentence, they make the model restart what it was saying.
-6. **Quiz.** `getQuiz` writes five multiple-choice questions for the module. It is requested in the background when the lesson starts, so it is ready when Ceeq calls `finish_module` and the screen switches to it. Answers get instant feedback and an explanation; Ceeq is told the score and reacts.
-7. **Revisiting.** From the chapter page any module's lesson or quiz can be reopened as often as the student likes. A quiz can be retaken as is or with new questions (earlier ones are sent along so they are not repeated). Every attempt is kept; a module is passed at 60%.
-8. **Real images.** For anything that exists in the real world Ceeq adds an `image` block with a short search phrase, never a URL. The browser finds the picture (`apps/tutor-web/lib/images.ts`): first among the pictures of the matching Wikipedia article, then on Wikimedia Commons, ranked for relevance and English labels, with adult content and off-subject results refused. Nothing is shown rather than a wrong picture.
-9. **Progress.** Goals, answers, misconceptions and quiz attempts are saved per module on the device and fed back when the student returns, so Ceeq continues where they left off.
+6. **Tools, not free rein.** Ceeq acts only through her tools, all validated in the browser before anything changes: `whiteboard` (self-laying-out blocks: real images, text with inline maths, formulas incl. chemistry, lists, tables, graphs, number lines, diagrams), `update_progress`, `record_answer`, `start_practice` and `finish_module` (in a revision, `finish_revision` instead of the last two). Tool calls come before speech in a turn: called mid-sentence, they make the model restart what it was saying.
+7. **Quiz.** `getQuiz` writes five multiple-choice questions for the module, each marked with the goal it tests. It is requested in the background when the lesson starts, so it is ready when Ceeq calls `finish_module` and the screen switches to it. Answers get instant feedback and an explanation; Ceeq is told the score and reacts.
+8. **Revisiting.** From the chapter page any module's lesson or quiz can be reopened as often as the student likes. A quiz can be retaken as is or with new questions (earlier ones are sent along so they are not repeated). Every attempt is kept; a module is passed at 60%.
+9. **Real images.** For anything that exists in the real world Ceeq adds an `image` block with a short search phrase, never a URL. The browser finds the picture (`apps/tutor-web/lib/images.ts`): first among the pictures of the matching Wikipedia article, then on Wikimedia Commons, ranked for relevance and English labels, with adult content and off-subject results refused. Nothing is shown rather than a wrong picture.
+10. **Progress.** Goals, answers, misconceptions and quiz attempts are saved per module and fed back when the student returns, so Ceeq continues where they left off. The app works from a copy on the device, kept under the student's id, so everything shows at once. Each change is also saved to their account in Firestore (`students/{uid}` and `students/{uid}/chapters/{chapter}`, `apps/tutor-web/lib/sync.ts`); at sign-in the two copies are combined, the later change winning, so progress follows the student to any device.
+11. **Weak spots.** A wrong spoken answer, or a missed quiz question, marks the goal it was about as a weak spot, with a note of what went wrong (`packages/shared-types/src/revision.ts`). The home page reminds the student what they have to revise across every subject, and the chapter page marks the modules concerned.
+12. **Revision.** "Revise" opens a short lesson on one module's weak spots. Ceeq is given only those goals and what went wrong, explains each again in a different way and checks it with a question; the app waits for the student throughout. A goal the student now gets right is checked once more three days later and comes off the list when that check is passed; a wrong answer at any point puts it back.
 
-Persistence across devices (Firestore), accounts and RAG over textbooks come next.
+Reminders outside the app (text or push), limits on misuse (App Check, per-student rate limits) and RAG over textbooks come next.
 
 ## 1. Purpose
 

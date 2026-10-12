@@ -54,6 +54,12 @@ describe('quiz', () => {
     expect(parseQuizReply(reply)).toHaveLength(5);
   });
 
+  it('asks which goal each question tests, and keeps the answer', () => {
+    expect(buildQuizPrompt({ ...ref, module })).toContain('"goal" is the number of the goal');
+    const reply = JSON.stringify({ questions: [question(1, { goal: 1 }), question(2, { goal: 'x' }), question(3)] });
+    expect(parseQuizReply(reply).map((q) => q.goal)).toEqual([1, undefined, undefined]);
+  });
+
   it('tells the model which earlier questions to avoid', () => {
     const prompt = buildQuizPrompt({ ...ref, module, avoid: ['What is 1 ohm?'] });
     expect(prompt).toContain(`checks only this module: "Ohm's law"`);

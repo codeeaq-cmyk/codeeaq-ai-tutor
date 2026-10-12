@@ -1,20 +1,28 @@
 "use client";
 
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import {
   applyBoardUpdate,
+  applyQuizAnswers,
   bestAttempt,
+  dueGoals,
   EMPTY_BOARD,
+  markMissed,
+  markRevised,
   moduleState,
   parseAnswer,
   parseProgressUpdate,
+  revisionTopics,
   validateBoardUpdate,
   type BoardState,
   type ChapterPlan,
   type GoalStatus,
   type LessonMode,
   type ModulePlan,
+  type WeakGoal,
+  type WeakSpot,
 } from "@codeeaq/shared-types";
 import { Board } from "@/features/board/Board";
 import { Missing } from "@/features/chapter/ChapterScreen";
@@ -26,16 +34,39 @@ import { loadQuiz, prefetchQuiz, useChapterPlan } from "@/lib/course";
 import { startVoice } from "@/lib/firebase";
 import { usePace } from "@/lib/pace";
 import { readChapterProgress, savePlan, updateModule, useChapterProgress } from "@/lib/progress";
+import { dayLabel, reasonFor } from "@/lib/revise";
 import { useChapterTarget, type ChapterRouteProps, type ChapterTarget } from "@/lib/target";
-import { CARRY_ON, carryOnLimit, GAP_AFTER_STUDENT_MS, LEAD_MS, openingFor, SILENCE_MS, startingMode, WRAP_UP } from "./lessonFlow";
+import {
+  CARRY_ON,
+  carryOnLimit,
+  Evidence,
+  GAP_AFTER_STUDENT_MS,
+  goalInHand,
+  LEAD_MS,
+  openingFor,
+  revisionOpening,
+  SILENCE_MS,
+  startingMode,
+  WRAP_UP,
+} from "./lessonFlow";
 
 interface Props extends ChapterRouteProps {
   moduleId: string;
   /** Open straight on the quiz instead of the lesson. */
   startWithQuiz: boolean;
+  /** Open as a revision of the module's weak spots instead of the whole lesson. */
+  revise: boolean;
 }
 
-export function LessonScreen({ moduleId, startWithQuiz, ...route }: Props) {
+interface LessonProps {
+  target: ChapterTarget;
+  plan: ChapterPlan;
+  index: number;
+  provisional: boolean;
+  startWithQuiz: boolean;
+}
+
+export function LessonScreen({ moduleId, startWithQuiz, revise, ...route }: Props) {
   const state = useChapterTarget(route);
   const target = state.status === "ready" ? state.target : undefined;
   const { state: planState } = useChapterPlan(target?.key, target?.ref);
@@ -52,44 +83,69 @@ export function LessonScreen({ moduleId, startWithQuiz, ...route }: Props) {
       </main>
     );
   }
-  return (
-    <ModuleLesson
-      key={`${target.key}/${moduleId}`}
-      target={target}
-      plan={planState.plan}
-      index={index}
-      provisional={planState.provisional}
-      startWithQuiz={startWithQuiz}
-    />
+  const lesson = { target, plan: planState.plan, index, provisional: planState.provisional, startWithQuiz };
+  // The lesson and its revision are separate sittings with Ceeq, each with its own instructions.
+  return revise ? (
+    <Revision key={`${target.key}/${moduleId}/revise`} {...lesson} />
+  ) : (
+    <ModuleLesson key={`${target.key}/${moduleId}`} {...lesson} />
   );
 }
 
-function ModuleLesson({
-  target,
-  plan,
-  index,
-  provisional,
-  startWithQuiz,
-}: {
-  target: ChapterTarget;
-  plan: ChapterPlan;
-  index: number;
-  provisional: boolean;
-  startWithQuiz: boolean;
-}) {
+/**
+ * A revision covers the weak spots that are due when it opens. The list is
+ * fixed for the sitting, so topics stay in view as they are ticked off.
+ */
+function Revision(props: LessonProps) {
+  const mod = props.plan.modules[props.index];
+  const [topics] = useState(() => dueGoals(readChapterProgress(props.target.key)?.modules[mod.id], Date.now()));
+  if (!topics.length) {
+    return (
+      <main className="flex min-h-screen flex-col items-center justify-center gap-2 p-6 text-center">
+        <h1 className="text-xl font-semibold">Nothing to revise here right now</h1>
+        <p className="max-w-sm text-muted">Ceeq will remind you when a topic in “{mod.title}” needs another look.</p>
+        <div className="mt-4 flex flex-wrap justify-center gap-3">
+          <Link href={props.target.href()} className="rounded-xl bg-accent px-4 py-2.5 font-semibold text-accent-fg hover:opacity-90">Back to the chapter</Link>
+          <Link href={props.target.href(mod.id)} className="rounded-xl border border-line px-4 py-2.5 font-medium hover:border-muted">Open the lesson</Link>
+        </div>
+      </main>
+    );
+  }
+  return <ModuleLesson {...props} topics={topics} />;
+}
+
+type View = "lesson" | "quiz" | "done";
+/** How a revised topic went in this sitting. */
+type Outcome = "got" | "later";
+
+function ModuleLesson({ target, plan, index, provisional, startWithQuiz, topics }: LessonProps & { topics?: WeakGoal[] }) {
+  const router = useRouter();
   const mod = plan.modules[index];
   const nextModule = plan.modules[index + 1];
+  const revising = !!topics;
   const progress = useChapterProgress(target.key)?.modules[mod.id];
   const [board, setBoard] = useState<BoardState>(EMPTY_BOARD);
-  const [view, setViewState] = useState<"lesson" | "quiz">(startWithQuiz ? "quiz" : "lesson");
+  const [view, setViewState] = useState<View>(startWithQuiz ? "quiz" : "lesson");
   const [text, setText] = useState("");
+  const [outcomes, setOutcomes] = useState<Record<number, Outcome>>({});
+  /** The time by which "due" is judged; moved on when the student does something that adds to the list. */
+  const [clock, setClock] = useState(() => Date.now());
 
   // Which spoken part the lesson is in, and whether the student has paused the
   // explanation. Each is kept in a ref as well, because the voice callbacks
   // below run outside render and must see the value as it is now.
-  const [mode, setModeState] = useState<LessonMode>("explain");
+  const [mode, setModeState] = useState<LessonMode>(revising ? "practice" : "explain");
   const [paused, setPausedState] = useState(false);
-  const flow = useRef({ mode: "explain" as LessonMode, paused: false, view: startWithQuiz ? "quiz" : "lesson", prompts: 0 });
+  const flow = useRef({
+    mode: (revising ? "practice" : "explain") as LessonMode,
+    paused: false,
+    view: (startWithQuiz ? "quiz" : "lesson") as View,
+    prompts: 0,
+    /** Goals Ceeq has finished with in this sitting: understood, or left for another day. */
+    settled: new Set<number>(),
+  });
+  // What the student has said in this sitting, which Ceeq's judgements must rest on.
+  const evidence = useRef(new Evidence());
   const carryOnTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const setMode = useCallback((next: LessonMode) => {
     flow.current.mode = next;
@@ -99,7 +155,7 @@ function ModuleLesson({
     flow.current.paused = next;
     setPausedState(next);
   }, []);
-  const setView = useCallback((next: "lesson" | "quiz") => {
+  const setView = useCallback((next: View) => {
     flow.current.view = next;
     setViewState(next);
   }, []);
@@ -110,8 +166,9 @@ function ModuleLesson({
         ...target.ref,
         module: { title: mod.title, goals: mod.goals },
         chapterModules: plan.modules.map((m) => m.title),
+        ...(topics ? { revise: revisionTopics(topics) } : {}),
       }),
-    [target, mod, plan],
+    [target, mod, plan, topics],
   );
 
   // Tool calls from Ceeq. Everything is validated before it touches the screen.
@@ -133,24 +190,57 @@ function ModuleLesson({
           // While she is still explaining, anything else just means "being taught".
           const tooEarly = flow.current.mode === "explain" && change.status !== "learning";
           const status = tooEarly ? "learning" : change.status;
-          updateModule(target.key, mod.id, (m) => ({ ...m, goals: m.goals.map((g, i) => (i === change.index ? status : g)) }));
+          // A result with nothing from the student behind it is not recorded.
+          if (status !== "learning" && !evidence.current.allowResult()) return { ok: true };
+          const now = Date.now();
+          let revisionOver = false;
+          if (status !== "learning") {
+            flow.current.settled.add(change.index);
+            if (topics) {
+              setOutcomes((o) => ({ ...o, [change.index]: status === "understood" ? "got" : "later" }));
+              revisionOver = topics.every((t) => flow.current.settled.has(t.index));
+            }
+          }
+          updateModule(target.key, mod.id, (m) => {
+            // In a revision "learning" only says which topic she is on: what the student showed before still stands.
+            const next = revising && status === "learning" ? m : { ...m, goals: m.goals.map((g, i) => (i === change.index ? status : g)) };
+            // Understanding a weak goal counts as revising it. Still struggling keeps it on the list.
+            if (status === "understood") return markRevised(next, change.index, now);
+            return status === "practice" ? markMissed(next, change.index, undefined, now) : next;
+          });
+          if (revisionOver) {
+            // The list is finished whether or not she goes on to say so: show the student how it went.
+            setView("done");
+            return { ok: true, note: "That was the last topic of this revision. Say in two sentences what the student did well, say goodbye, and stop. Do not begin another topic or ask another question." };
+          }
           // Deliberately no comment back: telling her so made her apologise to the student.
           return { ok: true };
         }
         case "record_answer": {
-          const answer = parseAnswer(args);
+          const answer = parseAnswer(args, mod.goals.length);
           if (!answer) return { ok: false, error: "correct must be true or false" };
-          updateModule(target.key, mod.id, (m) => ({
-            ...m,
-            correct: m.correct + (answer.correct ? 1 : 0),
-            incorrect: m.incorrect + (answer.correct ? 0 : 1),
-            mistakes: answer.mistake && !m.mistakes.includes(answer.mistake) ? [...m.mistakes, answer.mistake].slice(-10) : m.mistakes,
-          }));
+          // Only what the student actually said can be right or wrong.
+          if (!evidence.current.allowAnswer()) return { ok: true };
+          // She works through the goals in order, so an answer with no goal is about the one in hand.
+          const order = topics ? topics.map((t) => t.index) : mod.goals.map((_, i) => i);
+          const goal = answer.index ?? goalInHand(order, flow.current.settled);
+          const now = Date.now();
+          updateModule(target.key, mod.id, (m) => {
+            const next = {
+              ...m,
+              correct: m.correct + (answer.correct ? 1 : 0),
+              incorrect: m.incorrect + (answer.correct ? 0 : 1),
+              mistakes: answer.mistake && !m.mistakes.includes(answer.mistake) ? [...m.mistakes, answer.mistake].slice(-10) : m.mistakes,
+            };
+            // A wrong answer puts the goal on the student's list of things to revise.
+            return answer.correct ? next : markMissed(next, goal, answer.mistake, now);
+          });
           return { ok: true };
         }
         case "start_practice":
           // The explanation is over: from here the app waits for the student.
           setMode("practice");
+          evidence.current.practiceBegan();
           updateModule(target.key, mod.id, (m) => ({
             ...m,
             explained: true,
@@ -159,6 +249,10 @@ function ModuleLesson({
           }));
           return { ok: true, note: "The app now waits for the student after each of your turns." };
         case "finish_module":
+          // The quiz comes after practice, and practice needs the student to have answered something.
+          if (flow.current.mode !== "practice" || !evidence.current.practised) {
+            return { ok: true, note: "The student has not practised yet, so the quiz is not shown. Ask a practice question and wait for their answer." };
+          }
           // Ceeq sometimes forgets to tick a goal off; finishing means they were all covered.
           updateModule(target.key, mod.id, (m) => ({
             ...m,
@@ -169,11 +263,19 @@ function ModuleLesson({
           setMode("practice");
           setView("quiz");
           return { ok: true, note: "The quiz is now on the student's screen. Wish them luck in one short sentence, then stay silent until you are told the result." };
+        case "finish_revision": {
+          const left = (topics ?? []).filter((t) => !flow.current.settled.has(t.index));
+          if (left.length) {
+            return { ok: true, note: `The revision is not finished: goal ${left.map((t) => t.index + 1).join(" and goal ")} still to go over. Carry on with it.` };
+          }
+          setView("done");
+          return { ok: true, note: "The student can now see how the revision went. Say your closing words, then stay silent." };
+        }
         default:
           return { ok: false, error: "Unknown tool" };
       }
     },
-    [target.key, mod, setMode, setView],
+    [target.key, mod, topics, revising, setMode, setView],
   );
 
   const { pace, nextPace } = usePace();
@@ -221,6 +323,7 @@ function ModuleLesson({
   // When the student speaks or types, hold the prompt back (Ceeq will answer
   // them first), and un-pause so that her answer can be heard.
   const onStudentInput = useCallback(() => {
+    evidence.current.studentSpoke();
     cancelCarryOn();
     if (!flow.current.paused) return;
     setPaused(false);
@@ -247,18 +350,39 @@ function ModuleLesson({
 
   useEffect(() => cancelCarryOn, [cancelCarryOn]);
 
-  /** Connects and begins the lesson in the part the student has reached. */
+  /** Connects and begins the lesson in the part the student has reached, or the revision. */
   const begin = useCallback(
     (voiceNow: ReturnType<typeof useCeeqVoice>) => {
       const saved = readChapterProgress(target.key)?.modules[mod.id];
+      const settled = flow.current.settled;
       cancelCarryOn();
       flow.current.prompts = 0;
-      setMode(startingMode(saved));
+      // A new connection is a new conversation: nothing has been said in it yet.
+      evidence.current = new Evidence();
       setPaused(false);
       setView("lesson");
+      if (topics) {
+        // Reconnecting after a dropped line carries on down the list; a finished revision starts afresh.
+        if (topics.every((t) => settled.has(t.index))) {
+          settled.clear();
+          setOutcomes({});
+        }
+        setMode("practice");
+        void voiceNow.connect(revisionOpening(topics.filter((t) => settled.has(t.index)).map((t) => t.index + 1)));
+        return;
+      }
+      const startIn = startingMode(saved);
+      settled.clear();
+      // Resuming practice: the goals settled last time are not asked again.
+      if (startIn === "practice") {
+        saved?.goals.forEach((g, i) => {
+          if (g === "understood" || g === "practice") settled.add(i);
+        });
+      }
+      setMode(startIn);
       void voiceNow.connect(openingFor(mod, saved));
     },
-    [cancelCarryOn, mod, setMode, setPaused, setView, target.key],
+    [cancelCarryOn, mod, topics, setMode, setPaused, setView, target.key],
   );
 
   const start = useCallback(() => begin(voice), [begin, voice]);
@@ -281,7 +405,7 @@ function ModuleLesson({
   // start writing the quiz so it is ready when the lesson ends, and mint the
   // voice token. All three are safe to repeat.
   useEffect(() => {
-    if (provisional) savePlan(target.key, plan);
+    if (provisional) savePlan(target.key, plan, { subject: target.subject, chapter: target.chapter });
     prefetchQuiz(target.key, target.ref, mod);
     voice.prepare();
     // Begin straight away when the student arrived by clicking (browsers then
@@ -303,12 +427,21 @@ function ModuleLesson({
 
   const onQuizFinished = useCallback(
     (result: QuizResult) => {
-      updateModule(target.key, mod.id, (m) => ({
-        ...m,
-        // Reaching the quiz any way counts as having covered the module.
-        learned: true,
-        attempts: [...m.attempts, { score: result.score, total: result.total, at: Date.now() }],
-      }));
+      const now = Date.now();
+      updateModule(target.key, mod.id, (m) =>
+        // Each missed question puts the goal it tested on the student's list of things to revise.
+        applyQuizAnswers(
+          {
+            ...m,
+            // Reaching the quiz any way counts as having covered the module.
+            learned: true,
+            attempts: [...m.attempts, { score: result.score, total: result.total, at: now }],
+          },
+          result.answers,
+          now,
+        ),
+      );
+      setClock(now);
       const missed = result.missed.length ? `Questions they missed: ${result.missed.map((q) => `"${q}"`).join("; ")}.` : "They missed nothing.";
       voice.notify(`(Quiz result: ${result.score} out of ${result.total}. ${missed} Respond as instructed for a quiz result.)`);
     },
@@ -323,15 +456,42 @@ function ModuleLesson({
   const goals: GoalStatus[] = progress?.goals ?? mod.goals.map(() => "todo");
   const best = bestAttempt(progress);
   const state = moduleState(progress);
-  const startLabel = busy ? "Connecting…" : state === "new" ? "Start lesson" : state === "learning" ? "Continue lesson" : "Revisit lesson";
-  const notice = voice.error ?? (voice.status === "paused" ? "Lesson paused." : null);
+  const startLabel = busy
+    ? "Connecting…"
+    : revising
+      ? "Start revision"
+      : state === "new"
+        ? "Start lesson"
+        : state === "learning"
+          ? "Continue lesson"
+          : "Revisit lesson";
+  const notice = voice.error ?? (voice.status === "paused" ? (revising ? "Revision paused." : "Lesson paused.") : null);
   // Before the lesson is running, show the part it will start in.
   const part: Part = view === "quiz" ? "quiz" : live || busy ? mode : startingMode(progress);
   const explaining = live && view === "lesson" && mode === "explain";
-  const hint = !live || view === "quiz" ? null : paused ? "Paused. Press play to carry on." : mode === "explain" ? "Ceeq is explaining. Ask a question any time." : "Your turn. Answer out loud, or type.";
+  const hint =
+    !live || view !== "lesson"
+      ? null
+      : revising
+        ? "Ceeq goes over each topic, then asks you about it. Answer out loud, or type."
+        : paused
+          ? "Paused. Press play to carry on."
+          : mode === "explain"
+            ? "Ceeq is explaining. Ask a question any time."
+            : "Your turn. Answer out loud, or type.";
   const next = nextModule
     ? { href: target.href(nextModule.id), label: `Next: ${nextModule.title}` }
     : { href: target.href(), label: "Back to chapter" };
+  // After a quiz in the lesson, offer to go over what it showed up. A revision has just done that.
+  const toRevise = revising ? 0 : dueGoals(progress, clock).length;
+  const emptyBoard = busy
+    ? "Ceeq is getting ready…"
+    : live
+      ? "Ceeq will write here as she teaches."
+      : revising
+        ? "Press Start and Ceeq will go over these topics with you."
+        : "Press Start and Ceeq will explain this module, then practise it with you.";
+  const topicList = topics && <RevisionTopics module={mod} topics={topics} weak={progress?.weak} outcomes={outcomes} now={clock} />;
 
   const viewToggle =
     view === "lesson" ? (
@@ -352,8 +512,8 @@ function ModuleLesson({
         </Link>
         <div className="min-w-0 flex-1">
           <div className="truncate text-xs text-muted">
-            {target.chapter} · Module {index + 1} of {plan.modules.length}
-            <span className="lg:hidden"> · {PARTS.find((p) => p.id === part)?.label}</span>
+            {target.chapter} · {topics ? `Revision · ${topics.length === 1 ? "1 topic" : `${topics.length} topics`}` : `Module ${index + 1} of ${plan.modules.length}`}
+            {!revising && <span className="lg:hidden"> · {PARTS.find((p) => p.id === part)?.label}</span>}
           </div>
           <h1 className="truncate font-semibold">{mod.title}</h1>
         </div>
@@ -373,20 +533,34 @@ function ModuleLesson({
       </header>
 
       <div className="flex min-h-0 flex-1">
-        <section className="min-w-0 flex-1 overflow-y-auto bg-surface" aria-label={view === "quiz" ? "Quiz" : "Whiteboard"}>
+        <section className="min-w-0 flex-1 overflow-y-auto bg-surface" aria-label={view === "quiz" ? "Quiz" : view === "done" ? "Revision summary" : "Whiteboard"}>
           {view === "quiz" ? (
             <QuizView
               moduleTitle={mod.title}
               load={loadQuestions}
               onFinished={onQuizFinished}
-              onRevisitLesson={live ? () => setView("lesson") : start}
+              // From a revision, "revisit the lesson" means the whole lesson, which is another page.
+              onRevisitLesson={revising ? () => router.push(target.href(mod.id)) : live ? () => setView("lesson") : start}
               next={next}
+              revise={toRevise ? { href: target.href(mod.id, { revise: true }), count: toRevise } : undefined}
             />
+          ) : view === "done" ? (
+            <div className="mx-auto max-w-2xl px-5 py-6 sm:px-8 sm:py-10">
+              <div className="mb-5 text-sm font-medium text-muted">Revision · {mod.title}</div>
+              <h2 className="text-2xl font-semibold tracking-tight">Revision done</h2>
+              <p className="mt-1 text-muted">Here is how each topic went. Ceeq will remind you when one needs another look.</p>
+              <div className="mt-6 rounded-2xl border border-line p-5">{topicList}</div>
+              <div className="mt-6 flex flex-wrap gap-3">
+                <Link href={target.href()} onClick={voice.end} className="inline-flex items-center gap-2 rounded-xl bg-accent px-5 py-3 font-semibold text-accent-fg shadow-sm hover:opacity-90">
+                  Back to chapter <Icon name="chevron" className="h-4 w-4" />
+                </Link>
+                <button onClick={() => setView("quiz")} className="rounded-xl border border-line bg-surface px-4 py-3 font-medium hover:border-muted">
+                  {best ? "Retake the quiz" : "Take the quiz"}
+                </button>
+              </div>
+            </div>
           ) : (
-            <Board
-              board={board}
-              empty={busy ? "Ceeq is getting ready…" : live ? "Ceeq will write here as she teaches." : "Press Start and Ceeq will explain this module, then practise it with you."}
-            />
+            <Board board={board} empty={emptyBoard} />
           )}
         </section>
 
@@ -400,12 +574,17 @@ function ModuleLesson({
               {notice && <p className="mt-2 text-sm text-muted">{notice}</p>}
             </div>
           )}
-          <div>
-            <Parts current={part} />
-            {hint && <p className="mt-2.5 text-sm text-muted">{hint}</p>}
-          </div>
+          {revising ? (
+            hint && <p className="text-sm text-muted">{hint}</p>
+          ) : (
+            <div>
+              <Parts current={part} />
+              {hint && <p className="mt-2.5 text-sm text-muted">{hint}</p>}
+            </div>
+          )}
           {voice.caption && <p className="text-[15px] leading-relaxed text-muted">{voice.caption}</p>}
-          <Goals module={mod} statuses={goals} />
+          {/* Once a revision is done the main panel shows how each topic went. */}
+          {topics ? view !== "done" && topicList : <Goals module={mod} statuses={goals} due={dueGoals(progress, clock).map((g) => g.index)} />}
           {progress && progress.correct + progress.incorrect > 0 && (
             <p className="text-sm text-muted">
               {progress.correct} of {progress.correct + progress.incorrect} answers right
@@ -441,7 +620,7 @@ function ModuleLesson({
                 value={text}
                 onChange={(e) => setText(e.target.value)}
                 placeholder={voice.heard || (explaining ? "Ask a question any time" : voice.micOn ? "Just talk, or type here" : "Type your answer")}
-                className="min-w-0 flex-1 bg-transparent py-2.5 outline-none placeholder:text-muted"
+                className="plain-focus min-w-0 flex-1 bg-transparent py-2.5 placeholder:text-muted"
                 maxLength={500}
               />
               <button type="submit" disabled={!text.trim()} className="grid h-8 w-8 place-items-center rounded-full bg-fg text-bg disabled:opacity-20" aria-label="Send">
@@ -458,7 +637,12 @@ function ModuleLesson({
                 <Icon name={paused ? "play" : "pause"} />
               </button>
             )}
-            <button onClick={voice.end} className="grid h-11 w-11 shrink-0 place-items-center rounded-full text-muted hover:bg-surface-2 hover:text-fg" aria-label="End lesson" title="End lesson">
+            <button
+              onClick={voice.end}
+              className="grid h-11 w-11 shrink-0 place-items-center rounded-full text-muted hover:bg-surface-2 hover:text-fg"
+              aria-label={revising ? "End revision" : "End lesson"}
+              title={revising ? "End revision" : "End lesson"}
+            >
               <Icon name="stop" />
             </button>
           </div>
@@ -512,7 +696,8 @@ const STATUS_STYLE = {
   practice: "border-(--ink-amber)",
 } as const;
 
-function Goals({ module, statuses }: { module: ModulePlan; statuses: GoalStatus[] }) {
+/** The module's checklist. `due` lists the goals (by index) the student has to revise now. */
+function Goals({ module, statuses, due }: { module: ModulePlan; statuses: GoalStatus[]; due: number[] }) {
   return (
     <div>
       <h2 className="mb-3 text-sm font-medium text-muted">In this module</h2>
@@ -527,7 +712,61 @@ function Goals({ module, statuses }: { module: ModulePlan; statuses: GoalStatus[
               </span>
               <span className={`text-sm leading-snug ${status === "learning" ? "font-medium" : status === "todo" ? "text-muted" : ""}`}>
                 {goal}
-                {status === "practice" && <span className="ml-1.5 text-xs text-(--ink-amber)">practise again</span>}
+                {status === "practice" ? (
+                  <span className="ml-1.5 text-xs text-(--ink-amber)">practise again</span>
+                ) : (
+                  due.includes(i) && <span className="ml-1.5 text-xs text-(--ink-amber)">to revise</span>
+                )}
+              </span>
+            </li>
+          );
+        })}
+      </ol>
+    </div>
+  );
+}
+
+/** The topics of a revision, each with why it is here and, once dealt with, how it went. */
+function RevisionTopics({
+  module,
+  topics,
+  weak,
+  outcomes,
+  now,
+}: {
+  module: ModulePlan;
+  topics: WeakGoal[];
+  weak: (WeakSpot | null)[] | undefined;
+  outcomes: Record<number, Outcome>;
+  now: number;
+}) {
+  return (
+    <div>
+      <h2 className="mb-3 text-sm font-medium text-muted">Revising</h2>
+      <ol className="space-y-3.5">
+        {topics.map((topic) => {
+          const outcome = outcomes[topic.index];
+          const spot = weak?.[topic.index];
+          const line =
+            outcome === "got"
+              ? spot
+                ? `Got it. Ceeq will check it again ${dayLabel(spot.dueAt, now)}.`
+                : "Got it. Off your list."
+              : outcome === "later"
+                ? "Still tricky. You’ll come back to it."
+                : reasonFor(topic);
+          return (
+            <li key={topic.index} className="flex items-start gap-3">
+              <span
+                className={`mt-0.5 grid h-5 w-5 shrink-0 place-items-center rounded-full border-2 ${
+                  outcome === "got" ? STATUS_STYLE.understood : outcome === "later" ? STATUS_STYLE.practice : STATUS_STYLE.todo
+                }`}
+              >
+                {outcome === "got" && <Icon name="check" className="h-3 w-3" />}
+              </span>
+              <span className="min-w-0 text-sm leading-snug">
+                <span className="block font-medium">{module.goals[topic.index]}</span>
+                <span className={`mt-0.5 block ${outcome === "got" ? "text-(--ink-green)" : outcome === "later" ? "text-(--ink-amber)" : "text-muted"}`}>{line}</span>
               </span>
             </li>
           );

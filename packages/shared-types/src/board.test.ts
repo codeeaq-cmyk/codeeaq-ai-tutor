@@ -153,8 +153,11 @@ describe('lesson tool arguments', () => {
     expect(parseProgressUpdate({ goal: 2, status: 'understood' }, 3)).toEqual({ index: 1, status: 'understood' });
     expect(parseProgressUpdate({ goal: 4, status: 'understood' }, 3)).toBeNull();
     expect(parseProgressUpdate({ goal: 1, status: 'done' }, 3)).toBeNull();
-    expect(parseAnswer({ correct: false, mistake: 'mixed up I and R' })).toEqual({ correct: false, mistake: 'mixed up I and R' });
-    expect(parseAnswer({ correct: 'yes' })).toBeNull();
+    expect(parseAnswer({ correct: false, mistake: 'mixed up I and R' }, 3)).toEqual({ correct: false, mistake: 'mixed up I and R' });
+    expect(parseAnswer({ correct: 'yes' }, 3)).toBeNull();
+    // The goal an answer was about is kept only when it exists in the module.
+    expect(parseAnswer({ goal: 2, correct: true, mistake: 'ignored when right' }, 3)).toEqual({ correct: true, index: 1 });
+    expect(parseAnswer({ goal: 9, correct: false }, 3)).toEqual({ correct: false });
   });
 });
 

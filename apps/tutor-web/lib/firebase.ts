@@ -1,4 +1,6 @@
 import { getApps, initializeApp } from "firebase/app";
+import { connectAuthEmulator, getAuth } from "firebase/auth";
+import { connectFirestoreEmulator, getFirestore, initializeFirestore } from "firebase/firestore/lite";
 import { connectFunctionsEmulator, getFunctions, httpsCallable } from "firebase/functions";
 import { FUNCTIONS_REGION } from "@codeeaq/shared-types";
 import type {
@@ -12,16 +14,34 @@ import type {
   Syllabus,
 } from "@codeeaq/shared-types";
 
+/** True when the app talks to the local Firebase emulators instead of the live project. */
+export const USING_EMULATORS = process.env.NEXT_PUBLIC_USE_FUNCTIONS_EMULATOR !== "false";
+export const PROJECT_ID = process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID ?? "demo-ceeq";
+const EMULATOR_HOST = "127.0.0.1";
+export const AUTH_EMULATOR_URL = `http://${EMULATOR_HOST}:9099`;
+
+// In development this module can be evaluated again while the app it created
+// lives on; services are then looked up instead of being set up a second time.
+const existing = getApps()[0];
 const app =
-  getApps()[0] ??
+  existing ??
   initializeApp({
-    projectId: process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID ?? "demo-ceeq",
+    projectId: PROJECT_ID,
     apiKey: process.env.NEXT_PUBLIC_FIREBASE_API_KEY || "demo-key",
+    ...(process.env.NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN ? { authDomain: process.env.NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN } : {}),
+    ...(process.env.NEXT_PUBLIC_FIREBASE_APP_ID ? { appId: process.env.NEXT_PUBLIC_FIREBASE_APP_ID } : {}),
   });
 
+/** Phone-number sign-in. Students stay signed in on the device until they sign out. */
+export const auth = getAuth(app);
+/** Each student's profile and progress. The lite client is enough: the device copy gives speed and offline use. */
+export const db = existing ? getFirestore(app) : initializeFirestore(app, { ignoreUndefinedProperties: true });
 const functions = getFunctions(app, FUNCTIONS_REGION);
-if (process.env.NEXT_PUBLIC_USE_FUNCTIONS_EMULATOR !== "false") {
-  connectFunctionsEmulator(functions, "127.0.0.1", 5001);
+
+if (USING_EMULATORS && !existing) {
+  connectAuthEmulator(auth, AUTH_EMULATOR_URL, { disableWarnings: true });
+  connectFirestoreEmulator(db, EMULATOR_HOST, 8080);
+  connectFunctionsEmulator(functions, EMULATOR_HOST, 5001);
 }
 
 const getSyllabusFn = httpsCallable<GetSyllabusRequest, Syllabus>(functions, "getSyllabus", { timeout: 130_000 });
