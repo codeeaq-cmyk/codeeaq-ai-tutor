@@ -8,6 +8,12 @@
 // activity detection decides when the student has finished, so there is no
 // button to hold. Talking over Ceeq interrupts her. Tool calls from the model
 // (whiteboard, lesson plan, progress) are answered immediately in the browser.
+//
+// A connection to the service does not last a lesson: it ends after about ten
+// minutes, sooner if it is sent no sound, and now and then goes dead in the
+// middle of a reply. The lesson is then carried over to a new connection with
+// a new token (see `reconnect`); the app using this hook says what the Ceeq
+// on it must be told (see `CarryOver`).
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { GoogleGenAI, type LiveServerMessage, type Session } from "@google/genai";
