@@ -1,5 +1,15 @@
+import type { CSSProperties } from "react";
 import type { BoardBlock, BoardColor, DiagramShape } from "@codeeaq/shared-types";
 import { DIAGRAM_HEIGHT, DIAGRAM_WIDTH } from "@codeeaq/shared-types";
+import { band } from "./band";
+import { MathText } from "./MathText";
+import { plain } from "./plain";
+import { SHAPE_MS, startAt } from "./reveal";
+import { PICTURE_FONT } from "./Scenes";
+
+// Figures are drawn, not just shown: an outline traces itself (ink-draw, which
+// needs pathLength 1 on the element), and what fills or labels it comes up
+// once it is there. `at` is the moment a piece starts (see reveal.ts).
 
 const ink = (c: BoardColor | undefined, fallback = "var(--fg)") => (c ? `var(--ink-${c})` : fallback);
 const FONT = "var(--font-geist-sans), system-ui, sans-serif";
@@ -27,61 +37,78 @@ function wedge(cx: number, cy: number, r: number, i: number, parts: number) {
   return `M ${cx} ${cy} L ${cx + r * Math.cos(a0)} ${cy + r * Math.sin(a0)} A ${r} ${r} 0 ${a1 - a0 > Math.PI ? 1 : 0} 1 ${cx + r * Math.cos(a1)} ${cy + r * Math.sin(a1)} Z`;
 }
 
-function Shape({ shape }: { shape: DiagramShape }) {
-  const color = ink(shape.color);
+/** How long an outline takes to trace, and so when its filling and label come up. */
+const TRACE_MS = 450;
+
+function Shape({ shape, at }: { shape: DiagramShape; at: number }) {
+  const color = ink("color" in shape ? shape.color : undefined);
+  const trace = { pathLength: 1, className: "ink-draw", style: startAt(at), stroke: color, strokeWidth: 2, fill: "none" };
+  const after = { className: "ink-fade", style: startAt(at + TRACE_MS) };
   switch (shape.type) {
     case "circle":
       return (
         <g>
-          <circle cx={shape.x} cy={shape.y} r={shape.r} stroke={color} strokeWidth={2} fill={shape.filled ? color : "none"} fillOpacity={0.18} />
-          {shape.label && <Label x={shape.x} y={shape.y} text={shape.label} maxWidth={shape.r * 1.8} />}
+          {shape.filled && <circle cx={shape.x} cy={shape.y} r={shape.r} fill={color} fillOpacity={0.18} {...after} />}
+          <circle cx={shape.x} cy={shape.y} r={shape.r} {...trace} />
+          {shape.label && <Label x={shape.x} y={shape.y} text={shape.label} maxWidth={shape.r * 1.8} at={at + TRACE_MS} />}
         </g>
       );
     case "rect":
       return (
         <g>
-          <rect x={shape.x} y={shape.y} width={shape.w} height={shape.h} rx={4} stroke={color} strokeWidth={2} fill={shape.filled ? color : "none"} fillOpacity={0.18} />
-          {shape.label && <Label x={shape.x + shape.w / 2} y={shape.y + shape.h / 2} text={shape.label} maxWidth={shape.w - 8} />}
+          {shape.filled && <rect x={shape.x} y={shape.y} width={shape.w} height={shape.h} rx={4} fill={color} fillOpacity={0.18} {...after} />}
+          <rect x={shape.x} y={shape.y} width={shape.w} height={shape.h} rx={4} {...trace} />
+          {shape.label && <Label x={shape.x + shape.w / 2} y={shape.y + shape.h / 2} text={shape.label} maxWidth={shape.w - 8} at={at + TRACE_MS} />}
         </g>
       );
-    case "line":
+    case "line": {
+      // The head is drawn by hand, after the line has reached it: a marker would be there from the start.
+      const angle = Math.atan2(shape.y2 - shape.y1, shape.x2 - shape.x1);
+      const back = (turn: number) => `${shape.x2 - 9 * Math.cos(angle + turn)},${shape.y2 - 9 * Math.sin(angle + turn)}`;
       return (
-        <line
-          x1={shape.x1}
-          y1={shape.y1}
-          x2={shape.x2}
-          y2={shape.y2}
-          stroke={color}
-          strokeWidth={2}
-          strokeLinecap="round"
-          strokeDasharray={shape.dashed ? "6 5" : undefined}
-          markerEnd={shape.arrow ? "url(#arrow)" : undefined}
-          style={{ color }}
-        />
+        <g>
+          {shape.dashed ? (
+            <line x1={shape.x1} y1={shape.y1} x2={shape.x2} y2={shape.y2} stroke={color} strokeWidth={2} strokeLinecap="round" strokeDasharray="6 5" className="ink-fade" style={startAt(at)} />
+          ) : (
+            <line x1={shape.x1} y1={shape.y1} x2={shape.x2} y2={shape.y2} strokeLinecap="round" {...trace} />
+          )}
+          {shape.arrow && <polygon points={`${shape.x2},${shape.y2} ${back(0.45)} ${back(-0.45)}`} fill={color} {...after} />}
+        </g>
       );
-    case "polygon":
+    }
+    case "polygon": {
+      const points = shape.points.map((p) => `${p.x},${p.y}`).join(" ");
       return (
-        <polygon
-          points={shape.points.map((p) => `${p.x},${p.y}`).join(" ")}
-          stroke={color}
-          strokeWidth={2}
-          strokeLinejoin="round"
-          fill={shape.filled ? color : "none"}
-          fillOpacity={0.18}
-        />
+        <g>
+          {shape.filled && <polygon points={points} fill={color} fillOpacity={0.18} {...after} />}
+          <polygon points={points} strokeLinejoin="round" {...trace} />
+        </g>
       );
+    }
     case "text": {
-      const f = fit(shape.text, shape.x, shape.size ?? 14);
+      const words = plain(shape.text);
+      const f = fit(words, shape.x, shape.size ?? 14);
       return (
-        <text x={f.x} y={shape.y} fill={color} fontSize={f.fontSize} fontFamily={FONT} textAnchor={f.anchor} dominantBaseline="middle">
-          {shape.text}
+        <text x={f.x} y={shape.y} fill={color} fontSize={f.fontSize} fontFamily={FONT} textAnchor={f.anchor} dominantBaseline="middle" className="ink-fade" style={startAt(at)}>
+          {words}
         </text>
+      );
+    }
+    case "picture": {
+      const size = shape.size ?? 40;
+      return (
+        <g className="ink-fade" style={startAt(at)}>
+          <text x={shape.x} y={shape.y} fontSize={size} fontFamily={PICTURE_FONT} textAnchor="middle" dominantBaseline="central">
+            {shape.picture}
+          </text>
+          {shape.label && <Label x={shape.x} y={Math.min(DIAGRAM_HEIGHT - 8, shape.y + size * 0.62 + 9)} text={shape.label} />}
+        </g>
       );
     }
     case "pie": {
       const fill = ink(shape.color, "var(--ink-accent)");
       return (
-        <g>
+        <g className="ink-fade" style={startAt(at)}>
           {Array.from({ length: shape.parts }, (_, i) => (
             <path key={i} d={wedge(shape.x, shape.y, shape.r, i, shape.parts)} fill={i < shape.shaded ? fill : "none"} fillOpacity={0.35} stroke="var(--fg)" strokeWidth={1.5} strokeLinejoin="round" />
           ))}
@@ -92,7 +119,7 @@ function Shape({ shape }: { shape: DiagramShape }) {
       const fill = ink(shape.color, "var(--ink-accent)");
       const w = shape.w / shape.parts;
       return (
-        <g>
+        <g className="ink-fade" style={startAt(at)}>
           {Array.from({ length: shape.parts }, (_, i) => (
             <rect key={i} x={shape.x + i * w} y={shape.y} width={w} height={shape.h} fill={i < shape.shaded ? fill : "none"} fillOpacity={0.35} stroke="var(--fg)" strokeWidth={1.5} />
           ))}
@@ -102,11 +129,12 @@ function Shape({ shape }: { shape: DiagramShape }) {
   }
 }
 
-function Label({ x, y, text, maxWidth }: { x: number; y: number; text: string; maxWidth?: number }) {
-  const f = fit(text, x, 13, maxWidth);
+function Label({ x, y, text, maxWidth, at }: { x: number; y: number; text: string; maxWidth?: number; at?: number }) {
+  const words = plain(text);
+  const f = fit(words, x, 13, maxWidth);
   return (
-    <text x={f.x} y={y} fill="var(--fg)" fontSize={f.fontSize} fontFamily={FONT} textAnchor={f.anchor} dominantBaseline="middle">
-      {text}
+    <text x={f.x} y={y} fill="var(--fg)" fontSize={f.fontSize} fontFamily={FONT} textAnchor={f.anchor} dominantBaseline="middle" className={at === undefined ? undefined : "ink-fade"} style={at === undefined ? undefined : startAt(at)}>
+      {words}
     </text>
   );
 }
@@ -121,22 +149,27 @@ function ArrowMarker() {
   );
 }
 
-export function Diagram({ block }: { block: Extract<BoardBlock, { kind: "diagram" }> }) {
+export function Diagram({ block, at }: { block: Extract<BoardBlock, { kind: "diagram" }>; at: number }) {
+  // Only as deep as what is drawn on it (see band.ts).
+  const { top, height } = band(block.shapes);
   return (
     <figure className="flex flex-col items-center gap-1">
       <svg
-        viewBox={`0 0 ${DIAGRAM_WIDTH} ${DIAGRAM_HEIGHT}`}
+        viewBox={`0 ${top} ${DIAGRAM_WIDTH} ${height}`}
         className="w-full max-w-xl overflow-visible"
         style={{ color: "var(--fg)" }}
         role="img"
-        aria-label={block.caption ?? "Diagram"}
+        aria-label={block.caption ? plain(block.caption) : "Diagram"}
       >
-        <ArrowMarker />
         {block.shapes.map((shape, i) => (
-          <Shape key={i} shape={shape} />
+          <Shape key={i} shape={shape} at={at + i * SHAPE_MS} />
         ))}
       </svg>
-      {block.caption && <figcaption className="text-sm text-muted">{block.caption}</figcaption>}
+      {block.caption && (
+        <figcaption className="ink-fade text-sm text-muted" style={startAt(at + block.shapes.length * SHAPE_MS)}>
+          <MathText text={block.caption} />
+        </figcaption>
+      )}
     </figure>
   );
 }
@@ -157,7 +190,7 @@ function ticks(min: number, max: number, step = niceStep(max - min)) {
 
 const fmt = (v: number) => (Math.abs(v) >= 1e4 || (v !== 0 && Math.abs(v) < 1e-2) ? v.toExponential(1) : String(Number(v.toFixed(3))));
 
-export function Graph({ block }: { block: Extract<BoardBlock, { kind: "graph" }> }) {
+export function Graph({ block, at }: { block: Extract<BoardBlock, { kind: "graph" }>; at: number }) {
   const W = 400;
   const H = 260;
   const pad = { l: 40, r: 16, t: 14, b: 34 };
@@ -168,7 +201,7 @@ export function Graph({ block }: { block: Extract<BoardBlock, { kind: "graph" }>
   const legend = block.series.filter((s) => s.label);
 
   return (
-    <figure className="flex flex-col items-center gap-1">
+    <figure className="ink-rise flex flex-col items-center gap-1" style={startAt(at)}>
       <svg viewBox={`0 0 ${W} ${H}`} className="w-full max-w-lg" role="img" aria-label="Graph" fontFamily={FONT}>
         {ticks(block.xMin, block.xMax).map((x) => (
           <g key={`x${x}`}>
@@ -192,14 +225,15 @@ export function Graph({ block }: { block: Extract<BoardBlock, { kind: "graph" }>
               {inRange.map((p, j) => <circle key={j} cx={sx(p.x)} cy={sy(p.y)} r={3.5} />)}
             </g>
           ) : (
-            <polyline key={i} points={s.points.map((p) => `${sx(p.x)},${sy(p.y)}`).join(" ")} fill="none" stroke={color} strokeWidth={2.5} strokeLinejoin="round" clipPath="url(#plot)" />
+            // The line is plotted once the axes are there.
+            <polyline key={i} points={s.points.map((p) => `${sx(p.x)},${sy(p.y)}`).join(" ")} fill="none" stroke={color} strokeWidth={2.5} strokeLinejoin="round" clipPath="url(#plot)" pathLength={1} className="ink-draw" style={{ ...startAt(at + 400 + i * 300), "--dur": "800ms" } as CSSProperties} />
           );
         })}
         <clipPath id="plot">
           <rect x={pad.l} y={pad.t} width={W - pad.l - pad.r} height={H - pad.t - pad.b} />
         </clipPath>
-        {block.xLabel && <text x={W - pad.r} y={H - 4} fontSize={11} fill="var(--muted)" textAnchor="end">{block.xLabel}</text>}
-        {block.yLabel && <text x={pad.l} y={10} fontSize={11} fill="var(--muted)">{block.yLabel}</text>}
+        {block.xLabel && <text x={W - pad.r} y={H - 4} fontSize={11} fill="var(--muted)" textAnchor="end">{plain(block.xLabel)}</text>}
+        {block.yLabel && <text x={pad.l} y={10} fontSize={11} fill="var(--muted)">{plain(block.yLabel)}</text>}
       </svg>
       {legend.length > 0 && (
         <figcaption className="flex flex-wrap justify-center gap-3 text-sm text-muted">
@@ -207,7 +241,7 @@ export function Graph({ block }: { block: Extract<BoardBlock, { kind: "graph" }>
             s.label ? (
               <span key={i} className="flex items-center gap-1.5">
                 <span className="h-2 w-2 rounded-full" style={{ background: ink(s.color, ["var(--ink-accent)", "var(--ink-green)", "var(--ink-amber)", "var(--ink-red)"][i]) }} />
-                {s.label}
+                <MathText text={s.label} />
               </span>
             ) : null,
           )}
@@ -217,12 +251,12 @@ export function Graph({ block }: { block: Extract<BoardBlock, { kind: "graph" }>
   );
 }
 
-export function NumberLine({ block }: { block: Extract<BoardBlock, { kind: "number_line" }> }) {
+export function NumberLine({ block, at }: { block: Extract<BoardBlock, { kind: "number_line" }>; at: number }) {
   const W = 400;
   const pad = 20;
   const sx = (v: number) => pad + ((v - block.min) / (block.max - block.min)) * (W - 2 * pad);
   return (
-    <svg viewBox={`0 0 ${W} 70`} className="w-full max-w-lg" role="img" aria-label="Number line" fontFamily={FONT} style={{ color: "var(--fg)" }}>
+    <svg viewBox={`0 0 ${W} 70`} className="ink-rise w-full max-w-lg" role="img" aria-label="Number line" fontFamily={FONT} style={{ ...startAt(at), color: "var(--fg)" }}>
       <ArrowMarker />
       <line x1={pad - 10} x2={W - pad + 10} y1={30} y2={30} stroke="var(--fg)" strokeWidth={1.5} markerEnd="url(#arrow)" markerStart="url(#arrow)" />
       {ticks(block.min, block.max, block.step).map((v) => (
@@ -232,9 +266,10 @@ export function NumberLine({ block }: { block: Extract<BoardBlock, { kind: "numb
         </g>
       ))}
       {block.marks?.map((m, i) => (
-        <g key={i}>
+        // Each point is marked in turn, once the line is there.
+        <g key={i} className="ink-fade" style={startAt(at + 500 + i * 250)}>
           <circle cx={sx(m.value)} cy={30} r={5} fill="var(--ink-accent)" />
-          {m.label && <text x={sx(m.value)} y={16} fontSize={12} fill="var(--ink-accent)" textAnchor="middle" fontWeight={600}>{m.label}</text>}
+          {m.label && <text x={sx(m.value)} y={16} fontSize={12} fill="var(--ink-accent)" textAnchor="middle" fontWeight={600}>{plain(m.label)}</text>}
         </g>
       ))}
     </svg>

@@ -84,7 +84,8 @@ describe('buildTutorPrompt', () => {
       expect(prompt).toContain('clearly slower than everyday conversation');
       expect(prompt).toContain('Never call a tool once you have started speaking.');
       expect(prompt).toContain('TEACH, DO NOT READ: You are teaching');
-      expect(prompt).toContain('REAL PICTURES FIRST');
+      expect(prompt).toContain('DRAW IT.');
+      expect(prompt).not.toContain('image block');
       expect(prompt).toContain('SAFETY:');
     });
 

@@ -1,6 +1,10 @@
-// The whiteboard: a list of blocks that lay themselves out top to bottom.
+// The whiteboard: a list of blocks that lay themselves out top to bottom, and
+// are drawn in front of the student one after another as Ceeq speaks.
 // The model only sends data. It never sends markup, code or CSS, and nothing
 // reaches the screen without passing validateBoardUpdate.
+//
+// Every picture on it is the app's own. Photos searched for on the web were
+// tried and dropped: too often they showed something else.
 
 export const BOARD_COLORS = ['accent', 'blue', 'green', 'amber', 'red', 'gray'] as const;
 export type BoardColor = (typeof BOARD_COLORS)[number];
@@ -18,12 +22,45 @@ export interface Point {
   y: number;
 }
 
+/**
+ * One of the app's own drawings, named by the emoji that shows it ("☀️", "🌱",
+ * "🔋"). It can only ever be a picture of the thing named.
+ */
+export type Picture = string;
+
+/** One of the kinds, cases or examples set side by side in a panels block. */
+export interface Panel {
+  title: string;
+  picture?: Picture;
+  text?: string;
+  color?: BoardColor;
+}
+
+/** One step of a flow. `then` is what happens on the way to the next step, written along the arrow. */
+export interface FlowStep {
+  label: string;
+  picture?: Picture;
+  note?: string;
+  then?: string;
+}
+
+/** Something that goes into, comes out of, or belongs to the thing in the middle of a labelled block. */
+export interface PictureLabel {
+  text: string;
+  picture?: Picture;
+  side: 'left' | 'right';
+  /** "in": an arrow from the label to the thing. "out": from the thing to the label. "none": a plain line. */
+  arrow: 'in' | 'out' | 'none';
+}
+
 export type DiagramShape =
   | { type: 'circle'; x: number; y: number; r: number; color?: BoardColor; filled?: boolean; label?: string }
   | { type: 'rect'; x: number; y: number; w: number; h: number; color?: BoardColor; filled?: boolean; label?: string }
   | { type: 'line'; x1: number; y1: number; x2: number; y2: number; color?: BoardColor; arrow?: boolean; dashed?: boolean }
   | { type: 'polygon'; points: Point[]; color?: BoardColor; filled?: boolean }
   | { type: 'text'; x: number; y: number; text: string; color?: BoardColor; size?: number }
+  /** A picture centred on a point, with an optional label under it. */
+  | { type: 'picture'; x: number; y: number; picture: Picture; size?: number; label?: string }
   /** A circle cut into equal slices with some shaded, for fractions. */
   | { type: 'pie'; x: number; y: number; r: number; parts: number; shaded: number; color?: BoardColor }
   /** A bar cut into equal parts with some shaded, for fractions. */
@@ -57,8 +94,22 @@ export type BoardBlock =
       series: GraphSeries[];
     }
   | { kind: 'diagram'; id: string; caption?: string; shapes: DiagramShape[] }
-  /** A real photo or labelled diagram, found by the app from a short search query. */
-  | { kind: 'image'; id: string; query: string; caption?: string };
+  /**
+   * The notes of the goal being taught: what the student should carry away,
+   * written a line at a time as Ceeq explains. Sent again under the same id,
+   * the block grows: lines it does not have yet are added to it.
+   */
+  | { kind: 'notes'; id: string; title?: string; points: string[] }
+  /** Two to four kinds, cases or examples side by side, each with its own picture. */
+  | { kind: 'panels'; id: string; panels: Panel[] }
+  /** A process, a chain of cause and effect or, with `loop`, a cycle: steps joined by arrows. */
+  | { kind: 'flow'; id: string; steps: FlowStep[]; loop?: boolean; caption?: string }
+  /**
+   * One thing in the middle, with what goes into it, comes out of it or
+   * belongs to it on either side. With no labels it is simply a picture and
+   * its name.
+   */
+  | { kind: 'labelled'; id: string; picture?: Picture; title?: string; labels: PictureLabel[] };
 
 export type BoardBlockKind = BoardBlock['kind'];
 
@@ -79,18 +130,35 @@ export interface BoardState {
    * board while Ceeq talks.
    */
   clearPending?: boolean;
+  /**
+   * For each block, the number of the update that put it on the board (or
+   * last replaced it). Blocks that arrived together are drawn one after the
+   * other, and a block that is replaced is drawn afresh.
+   */
+  born?: Record<string, number>;
+  /** How many updates have added something so far. */
+  updates?: number;
+  /**
+   * For a block that was replaced by a longer version of itself (notes, or a
+   * list, with lines added): how many of its lines were there already. Those
+   * stand as they are; only the new ones are written.
+   */
+  kept?: Record<string, number>;
 }
 
 export const EMPTY_BOARD: BoardState = { blocks: [], highlight: null };
 
 export const MAX_BOARD_BLOCKS = 24;
+/** A goal's notes are a few lines, not a page. */
+export const MAX_NOTES = 8;
 
 export function applyBoardUpdate(board: BoardState, update: BoardUpdate): BoardState {
   const adding = (update.add?.length ?? 0) > 0;
   const wantsClear = update.clear === true || board.clearPending === true;
   // Wipe only when there is something to show instead; otherwise remember to.
   const wipe = wantsClear && adding;
-  const result = applyTo(wipe ? EMPTY_BOARD : { blocks: board.blocks, highlight: board.highlight }, update);
+  const from: BoardState = wipe ? { ...EMPTY_BOARD, updates: board.updates } : { blocks: board.blocks, highlight: board.highlight, born: board.born, updates: board.updates, kept: board.kept };
+  const result = applyTo(from, update);
   return wantsClear && !adding && board.blocks.length > 0 ? { ...result, clearPending: true } : result;
 }
 
@@ -101,13 +169,75 @@ function applyTo(board: BoardState, update: BoardUpdate): BoardState {
     blocks = blocks.filter((b) => !gone.has(b.id));
     if (highlight && gone.has(highlight)) highlight = null;
   }
-  for (const block of update.add ?? []) {
-    const index = blocks.findIndex((b) => b.id === block.id);
-    blocks = index === -1 ? [...blocks, block] : blocks.map((b, i) => (i === index ? block : b));
+  const adding = (update.add?.length ?? 0) > 0;
+  const updates = (board.updates ?? 0) + (adding ? 1 : 0);
+  const stamped: Record<string, number> = {};
+  const standing: Record<string, number> = {};
+  for (const incoming of update.add ?? []) {
+    const index = blocks.findIndex((b) => b.id === incoming.id);
+    const old = index === -1 ? undefined : blocks[index];
+    const block = old ? grown(old, incoming) : incoming;
+    blocks = old ? blocks.map((b, i) => (i === index ? block : b)) : [...blocks, block];
+    stamped[block.id] = updates;
+    standing[block.id] = old ? sharedLines(old, block) : 0;
   }
   if (blocks.length > MAX_BOARD_BLOCKS) blocks = blocks.slice(-MAX_BOARD_BLOCKS);
   if (update.highlight !== undefined) highlight = update.highlight;
-  return { blocks, highlight };
+  // Only blocks still on the board keep their number.
+  const born: Record<string, number> = {};
+  const kept: Record<string, number> = {};
+  for (const b of blocks) {
+    born[b.id] = stamped[b.id] ?? board.born?.[b.id] ?? 0;
+    kept[b.id] = standing[b.id] ?? board.kept?.[b.id] ?? 0;
+  }
+  return { blocks, highlight, born, updates, kept };
+}
+
+/** The lines of a block that is written a line at a time. */
+function linesOf(block: BoardBlock): string[] | undefined {
+  return block.kind === 'notes' ? block.points : block.kind === 'list' ? block.items : undefined;
+}
+
+/**
+ * Notes sent again under the same id grow. Ceeq is asked to send every line
+ * each time, but sometimes sends only the new one: either way the lines the
+ * block already had stay, and those it did not have are added after them.
+ */
+function grown(old: BoardBlock, incoming: BoardBlock): BoardBlock {
+  if (old.kind !== 'notes' || incoming.kind !== 'notes') return incoming;
+  const points = [...old.points, ...incoming.points.filter((p) => !old.points.includes(p))].slice(-MAX_NOTES);
+  return { ...incoming, points };
+}
+
+/** How many lines at the top of a replaced block are the same as before. */
+function sharedLines(old: BoardBlock, block: BoardBlock): number {
+  const before = linesOf(old);
+  const after = linesOf(block);
+  if (!before || !after || old.kind !== block.kind) return 0;
+  let n = 0;
+  while (n < before.length && n < after.length && before[n] === after[n]) n++;
+  return n;
+}
+
+/**
+ * A new topic begins: what was on the board for the last one is wiped. `since`
+ * is how many updates the board had seen when Ceeq began her turn: blocks put
+ * up after that already belong to the new topic, and stay. If there are none
+ * yet, the board is wiped when the first of them arrives, so that the student
+ * is never left looking at a blank board.
+ */
+export function startTopic(board: BoardState, since: number): BoardState {
+  const fresh = board.blocks.filter((b) => (board.born?.[b.id] ?? 0) > since);
+  if (fresh.length === board.blocks.length) return board;
+  if (!fresh.length) return { ...board, clearPending: true };
+  const born: Record<string, number> = {};
+  const kept: Record<string, number> = {};
+  for (const b of fresh) {
+    born[b.id] = board.born?.[b.id] ?? 0;
+    kept[b.id] = board.kept?.[b.id] ?? 0;
+  }
+  const highlight = board.highlight && fresh.some((b) => b.id === board.highlight) ? board.highlight : null;
+  return { blocks: fresh, highlight, born, kept, updates: board.updates };
 }
 
 // ---------- Validation ----------
@@ -132,6 +262,37 @@ function str(v: unknown, max = MAX_TEXT): string | undefined {
 
 function color(v: unknown): BoardColor | undefined {
   return BOARD_COLORS.find((c) => c === v);
+}
+
+// One emoji: a pictograph, with its variation selector, skin tone or joined parts, or a flag.
+const EMOJI = /\p{Extended_Pictographic}\uFE0F?[\u{1F3FB}-\u{1F3FF}]?(?:\u200D\p{Extended_Pictographic}\uFE0F?)*|[\u{1F1E6}-\u{1F1FF}]{2}/u;
+
+// Names the model sometimes writes in place of the emoji itself.
+const PICTURE_NAMES: Record<string, Picture> = {
+  sun: '☀️', moon: '🌙', star: '⭐', earth: '🌍', globe: '🌍', cloud: '☁️', rain: '🌧️', snow: '❄️', ice: '🧊', water: '💧', drop: '💧',
+  fire: '🔥', flame: '🔥', lightning: '⚡', electricity: '⚡', wind: '🌬️', wave: '🌊', sea: '🌊', river: '🏞️', mountain: '⛰️', volcano: '🌋',
+  plant: '🌱', seedling: '🌱', leaf: '🍃', tree: '🌳', flower: '🌸', seed: '🌰', fruit: '🍎', apple: '🍎', food: '🍲', rice: '🍚',
+  animal: '🐾', cow: '🐄', dog: '🐕', bird: '🐦', fish: '🐟', insect: '🐜', bee: '🐝', butterfly: '🦋', frog: '🐸',
+  person: '🧑', student: '🧑‍🎓', teacher: '🧑‍🏫', farmer: '🧑‍🌾', scientist: '🧑‍🔬', people: '👥', family: '👪',
+  heart: '🫀', lungs: '🫁', brain: '🧠', eye: '👁️', ear: '👂', tooth: '🦷', bone: '🦴', hand: '✋', muscle: '💪', blood: '🩸',
+  cell: '🦠', bacteria: '🦠', virus: '🦠', dna: '🧬', microscope: '🔬', telescope: '🔭', magnet: '🧲', battery: '🔋', bulb: '💡',
+  lamp: '💡', plug: '🔌', thermometer: '🌡️', beaker: '🧪', 'test tube': '🧪', flask: '⚗️', atom: '⚛️', gear: '⚙️', rocket: '🚀',
+  satellite: '🛰️', car: '🚗', bus: '🚌', train: '🚆', bicycle: '🚲', cycle: '🚲', ship: '🚢', plane: '✈️', ball: '⚽', cricket: '🏏',
+  house: '🏠', home: '🏠', school: '🏫', factory: '🏭', hospital: '🏥', bank: '🏦', temple: '🛕', market: '🛒', farm: '🌾', field: '🌾',
+  book: '📖', pencil: '✏️', pen: '🖊️', ruler: '📏', clock: '⏰', calendar: '📅', money: '💰', coin: '🪙', scale: '⚖️', balance: '⚖️',
+  map: '🗺️', flag: '🚩', india: '🇮🇳', crown: '👑', scroll: '📜', law: '⚖️', vote: '🗳️', phone: '📱', computer: '💻', pot: '🍲',
+  kettle: '🫖', cup: '☕', glass: '🥛', spoon: '🥄', salt: '🧂', soap: '🧼', key: '🔑', lock: '🔒', bell: '🔔', mirror: '🪞',
+};
+
+/**
+ * The picture the model named, or undefined. Only an emoji (or one of a few
+ * plain names for one) is taken: a picture is never guessed at, because a wrong
+ * one teaches the wrong thing.
+ */
+function picture(v: unknown): Picture | undefined {
+  if (typeof v !== 'string') return undefined;
+  const found = EMOJI.exec(v);
+  return found ? found[0] : PICTURE_NAMES[v.trim().toLowerCase()];
 }
 
 function strings(v: unknown, max = MAX_ITEMS): string[] | undefined {
@@ -181,9 +342,15 @@ function shape(v: unknown): DiagramShape | null {
       return optional<DiagramShape>({ type: 'polygon', points: pts }, { ...common, filled: v.filled === true || undefined });
     }
     case 'text': {
-      const text = str(v.text, 80);
+      // Models now and then put the words of a text shape under "label".
+      const text = str(v.text ?? v.label, 80);
       if (!num(v.x) || !num(v.y) || !text) return null;
       return optional<DiagramShape>({ type: 'text', x: cx(v.x), y: cy(v.y), text }, { ...common, size: num(v.size) ? clamp(v.size, 8, 48) : undefined });
+    }
+    case 'picture': {
+      const pic = picture(v.picture ?? v.emoji ?? v.text);
+      if (!num(v.x) || !num(v.y) || !pic) return null;
+      return optional<DiagramShape>({ type: 'picture', x: cx(v.x), y: cy(v.y), picture: pic }, { size: num(v.size) ? clamp(v.size, 16, 120) : undefined, label: str(v.label, 40) });
     }
     case 'pie':
     case 'bar': {
@@ -212,27 +379,45 @@ const KIND_ALIASES: Record<string, Obj> = {
   bullets: { kind: 'list' },
   points: { kind: 'list' },
   steps: { kind: 'list', ordered: true },
+  keypoints: { kind: 'notes' },
+  key_points: { kind: 'notes' },
+  summary: { kind: 'notes' },
   definition: { kind: 'callout', tone: 'remember' },
   note: { kind: 'callout', tone: 'remember' },
   why: { kind: 'callout', tone: 'why' },
   tip: { kind: 'callout', tone: 'tip' },
   example: { kind: 'callout', tone: 'example' },
   question: { kind: 'callout', tone: 'question' },
-  photo: { kind: 'image' },
-  picture: { kind: 'image' },
-  figure: { kind: 'image' },
+  compare: { kind: 'panels' },
+  comparison: { kind: 'panels' },
+  columns: { kind: 'panels' },
+  cards: { kind: 'panels' },
+  kinds: { kind: 'panels' },
+  process: { kind: 'flow' },
+  sequence: { kind: 'flow' },
+  chain: { kind: 'flow' },
+  timeline: { kind: 'flow' },
+  cycle: { kind: 'flow', loop: true },
+  labeled: { kind: 'labelled' },
+  parts: { kind: 'labelled' },
 };
 
 /** Fills common slips: an alias kind, or content under a neighbouring field name. */
 function normalise(v: Obj): Obj {
   const alias = typeof v.kind === 'string' ? KIND_ALIASES[v.kind.toLowerCase()] : undefined;
-  const out: Obj = alias ? { ...v, ...alias, tone: v.tone ?? alias.tone } : { ...v };
+  const out: Obj = alias ? { ...v, ...alias, tone: v.tone ?? alias.tone, ordered: v.ordered ?? alias.ordered } : { ...v };
+  // The contents of the three picture blocks, under the names models reach for.
+  if (out.kind === 'panels' && out.panels === undefined) out.panels = out.items ?? out.columns ?? out.cards;
+  if (out.kind === 'flow' && out.steps === undefined) out.steps = out.items ?? out.stages;
+  if (out.kind === 'labelled' && out.labels === undefined) out.labels = out.items ?? out.parts;
+  if (out.kind === 'notes' && out.points === undefined) out.points = out.items ?? out.notes ?? out.lines ?? (typeof out.text === 'string' ? out.text.split(/\n+/) : undefined);
   if (out.kind === 'math' && out.latex === undefined) out.latex = out.text;
   if ((out.kind === 'heading' || out.kind === 'text' || out.kind === 'callout') && out.text === undefined) {
     out.text = out.latex ?? (Array.isArray(out.items) ? out.items.join(' ') : undefined);
   }
-  if (out.kind === 'list' && out.items === undefined && typeof out.text === 'string') {
-    out.items = out.text.split(/\n+/);
+  // The lines of a list, under the other names for them, or as one piece of text.
+  if (out.kind === 'list' && out.items === undefined) {
+    out.items = out.points ?? out.steps ?? out.lines ?? (typeof out.text === 'string' ? out.text.split(/\n+/) : undefined);
   }
   return out;
 }
@@ -282,7 +467,6 @@ function block(raw: unknown, fallbackId: string): BoardBlock | null {
       return optional<BoardBlock>({ kind: 'number_line', id, min: v.min, max: v.max }, { step, marks: marks?.length ? marks : undefined });
     }
     case 'graph': {
-      if (!num(v.xMin) || !num(v.xMax) || !num(v.yMin) || !num(v.yMax) || v.xMax <= v.xMin || v.yMax <= v.yMin) return null;
       const series: GraphSeries[] = Array.isArray(v.series)
         ? v.series
             .filter(isObj)
@@ -294,10 +478,11 @@ function block(raw: unknown, fallbackId: string): BoardBlock | null {
               return [optional({ points: pts, style } as GraphSeries, { color: color(s.color), label: str(s.label, 40) })];
             })
         : [];
-      return optional<BoardBlock>(
-        { kind: 'graph', id, xMin: v.xMin, xMax: v.xMax, yMin: v.yMin, yMax: v.yMax, series },
-        { xLabel: str(v.xLabel, 40), yLabel: str(v.yLabel, 40) },
-      );
+      const given = num(v.xMin) && num(v.xMax) && num(v.yMin) && num(v.yMax) && v.xMax > v.xMin && v.yMax > v.yMin;
+      // With no range, or an impossible one, the axes are made to fit the points (and to show zero when it is near).
+      const range = given ? { xMin: v.xMin as number, xMax: v.xMax as number, yMin: v.yMin as number, yMax: v.yMax as number } : rangeOf(series);
+      if (!range) return null;
+      return optional<BoardBlock>({ kind: 'graph', id, ...range, series }, { xLabel: str(v.xLabel, 40), yLabel: str(v.yLabel, 40) });
     }
     case 'diagram': {
       const shapes = Array.isArray(v.shapes)
@@ -305,15 +490,70 @@ function block(raw: unknown, fallbackId: string): BoardBlock | null {
         : [];
       return shapes.length ? optional<BoardBlock>({ kind: 'diagram', id, shapes }, { caption: str(v.caption, 120) }) : null;
     }
-    case 'image': {
-      // Only a search phrase is accepted, never a URL: the app chooses the source.
-      const query = str(v.query ?? v.text, 80);
-      if (!query || /https?:|\/\//i.test(query)) return null;
-      return optional<BoardBlock>({ kind: 'image', id, query }, { caption: str(v.caption, 120) });
+    case 'notes': {
+      const points = strings(v.points, MAX_NOTES);
+      return points ? optional<BoardBlock>({ kind: 'notes', id, points }, { title: str(v.title, 40) }) : null;
+    }
+    case 'panels': {
+      const panels = (Array.isArray(v.panels) ? v.panels : []).filter(isObj).slice(0, 4).flatMap((p) => {
+        const title = str(p.title ?? p.label ?? p.heading, 40);
+        if (!title) return [];
+        return [optional<Panel>({ title }, { picture: picture(p.picture ?? p.emoji ?? p.icon), text: str(p.text ?? p.caption ?? p.note, 140), color: color(p.color) })];
+      });
+      // One panel compares nothing, but is still a picture with its name and a line about it.
+      return panels.length ? { kind: 'panels', id, panels } : null;
+    }
+    case 'flow': {
+      const steps = (Array.isArray(v.steps) ? v.steps : []).slice(0, 6).flatMap((raw) => {
+        // A bare string is a step with nothing but its name.
+        const s: unknown = typeof raw === 'string' ? { label: raw } : raw;
+        if (!isObj(s)) return [];
+        const label = str(s.label ?? s.title ?? s.text, 40);
+        if (!label) return [];
+        return [optional<FlowStep>({ label }, { picture: picture(s.picture ?? s.emoji ?? s.icon), note: str(s.note ?? s.caption, 80), then: str(s.then ?? s.arrow, 30) })];
+      });
+      if (steps.length < 2) return null;
+      // Only a cycle has anything happening after its last step.
+      if (v.loop !== true) delete steps[steps.length - 1].then;
+      return optional<BoardBlock>({ kind: 'flow', id, steps }, { loop: v.loop === true || undefined, caption: str(v.caption, 120) });
+    }
+    case 'labelled': {
+      const labels = (Array.isArray(v.labels) ? v.labels : []).slice(0, 6).flatMap((raw, i) => {
+        const l: unknown = typeof raw === 'string' ? { text: raw } : raw;
+        if (!isObj(l)) return [];
+        const text = str(l.text ?? l.label, 60);
+        if (!text) return [];
+        const arrow = l.arrow === 'in' || l.arrow === 'out' ? l.arrow : 'none';
+        // Unless told: what goes in stands on the left, what comes out on the right, and the rest take sides by turns.
+        const side = l.side === 'left' || l.side === 'right' ? l.side : arrow === 'in' ? 'left' : arrow === 'out' ? 'right' : i % 2 === 0 ? 'left' : 'right';
+        return [optional<PictureLabel>({ text, side, arrow }, { picture: picture(l.picture ?? l.emoji ?? l.icon) })];
+      });
+      const pic = picture(v.picture ?? v.emoji);
+      const title = str(v.title ?? v.text, 40);
+      // The middle needs something to show: a picture, or failing that its name.
+      if (!pic && !title) return null;
+      return optional<BoardBlock>({ kind: 'labelled', id, labels }, { picture: pic, title });
     }
     default:
       return null;
   }
+}
+
+/** Axes that take in every point of the series, or undefined when there are no points to fit. */
+function rangeOf(series: GraphSeries[]): { xMin: number; xMax: number; yMin: number; yMax: number } | undefined {
+  const all = series.flatMap((s) => s.points);
+  if (!all.length) return undefined;
+  const fit = (values: number[]) => {
+    const low = Math.min(...values);
+    const high = Math.max(...values);
+    // Start from zero when the values are all on one side of it and not far away.
+    const min = low >= 0 && low <= high / 2 ? 0 : low;
+    const max = high <= 0 && high >= low / 2 ? 0 : high;
+    return max > min ? [min, max] : [min - 1, max + 1];
+  };
+  const [xMin, xMax] = fit(all.map((p) => p.x));
+  const [yMin, yMax] = fit(all.map((p) => p.y));
+  return { xMin, xMax, yMin, yMax };
 }
 
 let autoId = 0;
@@ -360,7 +600,7 @@ const colorSchema = { type: 'string', enum: [...BOARD_COLORS] };
 export const WHITEBOARD_TOOL = {
   name: 'whiteboard',
   description:
-    'Update the whiteboard next to you. Blocks stack top to bottom automatically. Every explanation needs a visual block (image, diagram, graph, number_line or table), not only text. Use image for anything that exists in the real world: the app finds a real photo or labelled diagram. Keep text short. Re-using an id replaces that block, so you can build a diagram up step by step.',
+    'Update the whiteboard next to you. Blocks stack top to bottom automatically and are drawn in front of the student, one after another, as you speak. Every explanation needs a visual block (panels, flow, labelled, diagram, graph, number_line or table), not only text. A "picture" is always ONE emoji that plainly shows the thing itself (☀️ sun, 🌱 plant, 💧 water, 🔥 flame, 🔋 battery, 💡 bulb, 🧲 magnet, 🫀 heart, 🌍 earth, 🏭 factory); leave it out when no emoji shows the thing. Keep text short. Re-using an id replaces that block, so you can build a diagram up step by step.',
   parametersJsonSchema: {
     type: 'object',
     properties: {
@@ -378,7 +618,9 @@ export const WHITEBOARD_TOOL = {
           properties: {
             kind: {
               type: 'string',
-              enum: ['heading', 'text', 'math', 'list', 'callout', 'table', 'number_line', 'graph', 'diagram', 'image'],
+              enum: ['heading', 'text', 'math', 'list', 'callout', 'table', 'number_line', 'graph', 'diagram', 'panels', 'flow', 'labelled', 'notes'],
+              description:
+                'panels: kinds, cases or examples side by side. flow: a process, cause and effect, or a cycle, as steps joined by arrows. labelled: one thing in the middle with what goes in, comes out or belongs to it on either side. notes: the lines the student should copy down for the goal you are teaching.',
             },
             id: { type: 'string', description: 'Short unique id, e.g. "def1".' },
             text: { type: 'string', description: 'heading, text, callout. Inline maths goes between $...$.' },
@@ -420,19 +662,67 @@ export const WHITEBOARD_TOOL = {
                 required: ['points'],
               },
             },
-            query: {
-              type: 'string',
-              description:
-                'image: 2 to 4 plain search keywords naming one real thing; add "diagram" for a labelled diagram. E.g. "insect anatomy diagram", "honey bee", "human heart diagram", "Jallianwala Bagh", "India physical map".',
+            panels: {
+              type: 'array',
+              description: 'panels: 2 to 4 things set side by side, e.g. the three ways heat travels, or solid, liquid and gas.',
+              items: {
+                type: 'object',
+                properties: {
+                  title: { type: 'string', description: 'Its name, 1 to 3 words.' },
+                  picture: { type: 'string', description: 'One emoji that shows it.' },
+                  text: { type: 'string', description: 'One short line about it.' },
+                  color: colorSchema,
+                },
+                required: ['title'],
+              },
             },
-            caption: { type: 'string', description: 'diagram or image caption.' },
+            steps: {
+              type: 'array',
+              description: 'flow: 2 to 6 steps in order, e.g. seed, seedling, plant, flower; or water, vapour, cloud, rain with loop.',
+              items: {
+                type: 'object',
+                properties: {
+                  label: { type: 'string', description: 'The step, 1 to 3 words.' },
+                  picture: { type: 'string', description: 'One emoji that shows it.' },
+                  note: { type: 'string', description: 'A few words under the step.' },
+                  then: { type: 'string', description: 'What happens on the way to the next step, 1 or 2 words written along the arrow, e.g. "evaporation".' },
+                },
+                required: ['label'],
+              },
+            },
+            loop: { type: 'boolean', description: 'flow: the last step leads back to the first, making a cycle.' },
+            points: {
+              type: 'array',
+              items: { type: 'string' },
+              description:
+                'notes: the lines of the notes, each a complete statement of at most twelve words (inline $maths$ allowed). Use one notes block for a goal, with the same id every time, and send it with all its lines so far and the new one last: only the new line is written.',
+            },
+            picture: { type: 'string', description: 'labelled: one emoji showing the thing in the middle.' },
+            title: { type: 'string', description: 'labelled: the name of the thing in the middle. notes: a heading for them, if "Notes" will not do.' },
+            labels: {
+              type: 'array',
+              description:
+                'labelled: up to 6 things around the middle. For what goes in and what comes out (photosynthesis: sunlight, water and carbon dioxide in; oxygen and glucose out) put inputs on the left with arrow "in" and outputs on the right with arrow "out". For parts or properties use arrow "none".',
+              items: {
+                type: 'object',
+                properties: {
+                  text: { type: 'string', description: 'The label, a few words.' },
+                  picture: { type: 'string', description: 'One emoji that shows it.' },
+                  side: { type: 'string', enum: ['left', 'right'] },
+                  arrow: { type: 'string', enum: ['in', 'out', 'none'] },
+                },
+                required: ['text'],
+              },
+            },
+            caption: { type: 'string', description: 'diagram or flow caption.' },
             shapes: {
               type: 'array',
               description: `diagram shapes on a ${DIAGRAM_WIDTH}x${DIAGRAM_HEIGHT} canvas, origin top-left, y grows downward. Draw big: use most of the canvas with a 20px margin. Label things with text shapes placed just outside the figure (size 14). Recipes: triangle = polygon of 3 points + a text label at each vertex; angle or force = line with arrow; ray diagram = lines with arrow for rays, a vertical line for the mirror or lens, dashed line for the principal axis; circuit = rect/line segments with text labels; process or cycle = rects with label joined by arrow lines. pie/bar show fractions: parts equal slices, shaded of them coloured.`,
               items: {
                 type: 'object',
                 properties: {
-                  type: { type: 'string', enum: ['circle', 'rect', 'line', 'polygon', 'text', 'pie', 'bar'] },
+                  type: { type: 'string', enum: ['circle', 'rect', 'line', 'polygon', 'text', 'picture', 'pie', 'bar'] },
+                  picture: { type: 'string', description: 'picture: one emoji, drawn centred on x, y (size 40 unless given), with label under it.' },
                   x: { type: 'number' },
                   y: { type: 'number' },
                   r: { type: 'number' },

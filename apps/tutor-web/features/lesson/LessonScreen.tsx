@@ -15,6 +15,7 @@ import {
   parseAnswer,
   parseProgressUpdate,
   revisionTopics,
+  startTopic,
   validateBoardUpdate,
   type BoardState,
   type ChapterPlan,
@@ -139,6 +140,11 @@ function ModuleLesson({ target, plan, index, provisional, startWithQuiz, topics 
   const revising = !!topics;
   const progress = useChapterProgress(target.key)?.modules[mod.id];
   const [board, setBoard] = useState<BoardState>(EMPTY_BOARD);
+  // The board as it stands, for the callbacks below, which run outside render.
+  const boardRef = useRef(board);
+  useEffect(() => {
+    boardRef.current = board;
+  }, [board]);
   const [view, setViewState] = useState<View>(startWithQuiz ? "quiz" : "lesson");
   const [text, setText] = useState("");
   /** The student has finished the quiz in this sitting. */
@@ -173,6 +179,10 @@ function ModuleLesson({ target, plan, index, provisional, startWithQuiz, topics 
     resultDue: false,
     /** Ceeq has ended the lesson herself and sent the student to the quiz: a part gone back to now starts afresh. */
     finished: false,
+    /** The goal that what is on the board belongs to, once she has said which she is on. */
+    boardGoal: null as number | null,
+    /** How many updates the board had seen when her turn began: what she adds after that belongs to the turn. */
+    boardMark: 0,
   });
   // What the student has said in this sitting, which Ceeq's judgements must rest on.
   const evidence = useRef(new Evidence());
@@ -222,6 +232,12 @@ function ModuleLesson({ target, plan, index, provisional, startWithQuiz, topics 
           const status = tooEarly ? "learning" : change.status;
           // A result with nothing from the student behind it is not recorded.
           if (status !== "learning" && !evidence.current.allowResult()) return { ok: true };
+          // She has moved on to another goal: the last one's board is wiped, so that each goal is taught on a clean one.
+          if (status === "learning" && flow.current.boardGoal !== change.index) {
+            flow.current.boardGoal = change.index;
+            const since = flow.current.boardMark;
+            setBoard((b) => startTopic(b, since));
+          }
           const now = Date.now();
           let revisionOver = false;
           if (status !== "learning") {
@@ -349,6 +365,8 @@ function ModuleLesson({ target, plan, index, provisional, startWithQuiz, topics 
     // Held back to the limit, and nobody was heard to speak: it is the room that is loud.
     if (flow.current.held >= MAX_HOLD_MS) flow.current.noisy = true;
     flow.current.held = 0;
+    // Her next turn starts here: what she puts on the board from now on belongs to it.
+    flow.current.boardMark = boardRef.current.updates ?? 0;
     const prompts = ++flow.current.prompts;
     const limit = carryOnLimit(mod.goals.length);
     if (prompts > limit + 1) {
@@ -421,6 +439,7 @@ function ModuleLesson({ target, plan, index, provisional, startWithQuiz, topics 
     evidence.current.studentSpoke();
     cancelCarryOn();
     flow.current.held = 0;
+    flow.current.boardMark = boardRef.current.updates ?? 0;
     if (!flow.current.paused) return;
     setPaused(false);
     if (voiceRef.current?.release()) carryOver(voiceRef.current);
@@ -445,6 +464,8 @@ function ModuleLesson({ target, plan, index, provisional, startWithQuiz, topics 
       flow.current.quizReport = null;
       flow.current.resultDue = false;
       flow.current.finished = false;
+      flow.current.boardGoal = null;
+      flow.current.boardMark = boardRef.current.updates ?? 0;
       setQuizTaken(false);
       // A new connection is a new conversation: nothing has been said in it yet.
       evidence.current = new Evidence();
@@ -780,7 +801,7 @@ function ModuleLesson({ target, plan, index, provisional, startWithQuiz, topics 
               </div>
             </div>
           ) : (
-            <Board board={board} empty={emptyBoard} />
+            <Board board={board} empty={emptyBoard} paused={paused} />
           )}
         </section>
 

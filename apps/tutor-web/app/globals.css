@@ -79,15 +79,139 @@ body {
   outline: none;
 }
 
-/* New whiteboard blocks write themselves in. */
-@keyframes block-in {
+/*
+ * The whiteboard is drawn in front of the student. Each piece starts at its own
+ * moment: --at, in milliseconds from when its block was put on the board (set
+ * in features/board/reveal.ts). Until then it is not there; from then it is
+ * written, popped up, raised, grown or traced, according to its class.
+ */
+@keyframes ink-word {
   from {
     opacity: 0;
-    transform: translateY(6px);
+    transform: translateY(0.3em);
   }
 }
-.block-in {
-  animation: block-in 280ms cubic-bezier(0.2, 0.7, 0.2, 1) both;
+@keyframes ink-pop {
+  0% {
+    opacity: 0;
+    transform: scale(0.4) rotate(-10deg);
+  }
+  65% {
+    opacity: 1;
+    transform: scale(1.1) rotate(2deg);
+  }
+}
+@keyframes ink-rise {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+}
+@keyframes ink-fade {
+  from {
+    opacity: 0;
+  }
+}
+@keyframes ink-grow {
+  from {
+    transform: scaleX(0);
+  }
+}
+@keyframes ink-grow-y {
+  from {
+    transform: scaleY(0);
+  }
+}
+@keyframes ink-wipe-left {
+  from {
+    clip-path: inset(0 0 0 100%);
+  }
+  to {
+    clip-path: inset(0);
+  }
+}
+@keyframes ink-wipe-up {
+  from {
+    clip-path: inset(100% 0 0 0);
+  }
+  to {
+    clip-path: inset(0);
+  }
+}
+@keyframes ink-draw {
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+.ink-word,
+.ink-pop,
+.ink-rise,
+.ink-fade,
+.ink-grow,
+.ink-grow-y,
+.ink-wipe-left,
+.ink-wipe-up,
+.ink-draw {
+  animation-delay: calc(var(--at, 0) * 1ms);
+  animation-fill-mode: both;
+}
+/* A word written with a pen. */
+.ink-word {
+  display: inline-block;
+  animation-name: ink-word;
+  animation-duration: 240ms;
+  animation-timing-function: ease-out;
+}
+/* A picture set down on the board. */
+.ink-pop {
+  display: inline-block;
+  animation-name: ink-pop;
+  animation-duration: 520ms;
+  animation-timing-function: cubic-bezier(0.2, 0.8, 0.3, 1);
+}
+.ink-rise {
+  animation-name: ink-rise;
+  animation-duration: 380ms;
+  animation-timing-function: cubic-bezier(0.2, 0.7, 0.2, 1);
+}
+.ink-fade {
+  animation-name: ink-fade;
+  animation-duration: 320ms;
+  animation-timing-function: ease-out;
+}
+/* A straight line drawn from one end; the end is chosen with origin-left or origin-right. */
+.ink-grow {
+  animation-name: ink-grow;
+  animation-duration: 320ms;
+  animation-timing-function: ease-out;
+}
+.ink-grow-y {
+  animation-name: ink-grow-y;
+  animation-duration: 260ms;
+  animation-timing-function: ease-out;
+}
+/* A bent line uncovered from one end: from the right, or from the bottom. */
+.ink-wipe-left {
+  animation-name: ink-wipe-left;
+  animation-duration: 650ms;
+  animation-timing-function: ease-in-out;
+}
+.ink-wipe-up {
+  animation-name: ink-wipe-up;
+  animation-duration: 650ms;
+  animation-timing-function: ease-in-out;
+}
+/* An outline traced with a pen. The element must have pathLength 1. */
+.ink-draw {
+  stroke-dasharray: 1;
+  stroke-dashoffset: 1;
+  animation-name: ink-draw;
+  animation-duration: var(--dur, 450ms);
+  animation-timing-function: ease-in-out;
+}
+/* While the lesson is paused the drawing stands still, like Ceeq's voice. */
+[data-board-paused] [class*="ink-"] {
+  animation-play-state: paused;
 }
 
 @keyframes shimmer {
@@ -118,6 +242,9 @@ body {
 }
 
 @media (prefers-reduced-motion: reduce) {
+  [class*="ink-"] {
+    animation-delay: 0s !important;
+  }
   *,
   *::before,
   *::after {
