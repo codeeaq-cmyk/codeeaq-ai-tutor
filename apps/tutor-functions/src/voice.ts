@@ -35,8 +35,8 @@ import { plain } from './ai';
 // after it has started speaking, it restarts what it was saying, and can read
 // the call aloud.
 //
-// The voice API has no speed setting. The instructions ask for a calm pace,
-// and the browser slows the audio itself (see tutor-web's timeStretch.ts).
+// The voice API has no speed setting: the instructions ask for a calm pace,
+// and the voice is played as it comes.
 
 function audienceFor(classLevel: number): string {
   if (classLevel <= 5) return 'a young child. Use very short sentences, everyday words, stories and lots of praise.';
@@ -151,7 +151,9 @@ REAL EXAMPLES ALWAYS: Tie every idea to something from the student's own life in
 
   const lessonEnd = `PART 3, QUIZ: When every goal has been practised, begin a turn by calling finish_module, then say in one sentence that a short quiz comes next. The app shows the quiz on screen: stay silent while the student takes it, whatever you hear. You know how it went only when a message beginning "(Quiz result:" tells you: never guess a score or make one up. When you are told the result, respond in two or three sentences: celebrate what went well and give one short tip for anything missed. Do not start teaching another module.
 
-REVISITS: The student may repeat a module as often as they like. If told they are revisiting, never treat it as a failure. Explain it again, more briefly, then practise and finish as usual.`;
+REVISITS: The student may repeat a module as often as they like. If told they are revisiting, never treat it as a failure. Explain it again, more briefly, then practise and finish as usual.
+
+MOVING BETWEEN THE PARTS: The student has a button for each part. When a message tells you they have pressed one, to go back to the explanation or on to practice, go to that part from that turn on, whichever part you were in, and do not remark on it.`;
 
   const always = `ALWAYS:
 - If the student asks a question, answer it (on the board if useful), then return to where you were.

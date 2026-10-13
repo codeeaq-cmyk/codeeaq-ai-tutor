@@ -38,6 +38,28 @@ describe("openingFor", () => {
     expect(opening).toContain("first goal that is not understood");
   });
 
+  it("goes straight to practice when the student chooses it, even on a new module", () => {
+    const opening = openingFor(plan, undefined, Date.now(), "practice");
+    expect(opening).toContain("The student just opened this module and has asked to go straight to practice");
+    expect(opening).toContain("Begin by calling start_practice");
+    const back = openingFor(plan, { ...fresh, goals: ["learning", "todo"] }, Date.now(), "practice");
+    expect(back).toContain("The student is back at this module and has asked to go straight to practice");
+    expect(back).toContain("1. State the law — learning; 2. Calculate resistance — todo");
+  });
+
+  it("explains again when the student chooses it, though they had reached practice", () => {
+    const opening = openingFor(plan, { ...fresh, explained: true, goals: ["understood", "learning"] }, Date.now(), "explain");
+    expect(opening).toContain("has asked to hear the explanation again before practising");
+    expect(opening).toContain("Start with part 1, explaining");
+    expect(opening).toContain("Do not ask them anything until you start practice");
+  });
+
+  it("opens as usual when the part chosen is the one already reached", () => {
+    const reached: ModuleProgress = { ...fresh, explained: true, goals: ["understood", "learning"] };
+    expect(openingFor(plan, reached, 5, "practice")).toBe(openingFor(plan, reached, 5));
+    expect(openingFor(plan, undefined, 5, "explain")).toBe(openingFor(plan, undefined, 5));
+  });
+
   it("explains again, briefly, on a revisit", () => {
     const opening = openingFor(plan, { ...fresh, explained: true, learned: true, attempts: [{ score: 4, total: 5, at: 1 }] });
     expect(opening).toContain("revisiting this module");

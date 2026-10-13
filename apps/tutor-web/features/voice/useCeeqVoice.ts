@@ -18,7 +18,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { GoogleGenAI, type LiveServerMessage, type Session } from "@google/genai";
 import type { StartVoiceResponse } from "@codeeaq/shared-types";
-import { TimeStretcher } from "./timeStretch";
 import { endsSentence, pauseNear, TurnSpeech, type Cut } from "./turnSpeech";
 
 export type VoiceStatus = "idle" | "connecting" | "live" | "paused" | "error";
@@ -29,8 +28,6 @@ export type ToolHandler = (name: string, args: Record<string, unknown>) => Recor
 interface Options {
   getToken: () => Promise<StartVoiceResponse>;
   onToolCall: ToolHandler;
-  /** How fast Ceeq's voice plays: 1 is as the model speaks, 0.85 is 15% slower. */
-  speed: number;
   /**
    * Ceeq's speech for a turn has all arrived. `remainingMs` is how much of it
    * the student has yet to hear (speech arrives several times faster than it
@@ -79,7 +76,14 @@ const CONNECT_TIMEOUT_MS = 8000;
 const CONNECT_TRIES = 3;
 const PLAYBACK_SAMPLE_RATE = 24000; // Gemini Live's output audio rate
 const TOKEN_TTL_MS = 8 * 60 * 1000; // a token can open a connection for 10 minutes after it is minted
-const IDLE_PAUSE_MS = 4 * 60 * 1000; // pause after this long without the student
+const IDLE_PAUSE_MS = 4 * 60 * 1000; // stop the lesson after this long without the student
+/**
+ * A lesson the student has paused keeps its connection for this long, so that
+ * a short pause costs nothing to come back from. After that the connection is
+ * closed (an open one is paid for by the minute, and lasts ten at most), and
+ * the lesson is carried over to a new one when the student carries on.
+ */
+const PARK_AFTER_MS = 2 * 60 * 1000;
 /** The pause left between one of Ceeq's turns and the next when they follow straight on. */
 const BREATH_SECONDS = 0.7;
 // While Ceeq speaks, mic chunks quieter than this are treated as her own echo.
@@ -117,7 +121,7 @@ interface Piece {
   toSeconds: number;
 }
 
-export function useCeeqVoice({ getToken, onToolCall, speed, onTurnEnd, onStudentInput, onSilence }: Options) {
+export function useCeeqVoice({ getToken, onToolCall, onTurnEnd, onStudentInput, onSilence }: Options) {
   const [status, setStatus] = useState<VoiceStatus>("idle");
   const [activity, setActivity] = useState<VoiceActivity>("idle");
   const [micOn, setMicOn] = useState(false);
@@ -154,13 +158,14 @@ export function useCeeqVoice({ getToken, onToolCall, speed, onTurnEnd, onStudent
 
   // ---------- Where Ceeq's turn has got to ----------
   //
-  // Her speech arrives several times faster than it is spoken, and is played
-  // slower still. The lesson is paced by what the student has heard: a turn is
-  // over for the app once all its speech has arrived, and the app is told how
-  // much of it is still to play. The service's own "turn complete" comes when
-  // it reckons the speech has been heard at normal speed. That can be half a
-  // minute late (when she says more than is played) or never, so it is only a
-  // fallback. Prompting her before then simply cuts the service's turn short.
+  // Her speech arrives several times faster than it is spoken. The lesson is
+  // paced by what the student has heard: a turn is over for the app once all
+  // its speech has arrived, and the app is told how much of it is still to
+  // play. The service's own "turn complete" comes when it reckons the speech
+  // has been heard. That is about when the student has in fact heard it, but
+  // it can be half a minute late (when she says more than is played) or never
+  // come, so it is only a fallback. Prompting her before then simply cuts the
+  // service's turn short.
 
   /** Speech for a turn is arriving and the app has not yet been told the turn is over. */
   const midTurnRef = useRef(false);
@@ -188,6 +193,11 @@ export function useCeeqVoice({ getToken, onToolCall, speed, onTurnEnd, onStudent
   const closingRef = useRef(false);
   /** A prompt from the app that came while one connection was being replaced by another. */
   const pendingPromptRef = useRef<string | null>(null);
+  /** Something the student typed while there was no connection. */
+  const pendingTextRef = useRef<string | null>(null);
+  /** The connection of a paused lesson has been closed; the lesson itself is kept as it is. */
+  const parkedRef = useRef(false);
+  const parkTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   /** Since when nothing has been playing, or null while she can be heard. */
   const drainedAtRef = useRef<number | null>(null);
 
@@ -253,7 +263,7 @@ export function useCeeqVoice({ getToken, onToolCall, speed, onTurnEnd, onStudent
     return playCtxRef.current;
   }, []);
 
-  /** Freezes Ceeq's voice exactly where it is. Nothing is lost: it carries on from there. */
+  /** Freezes Ceeq's voice exactly where it is. Nothing is lost: it carries on from there. (See `hold`.) */
   const holdPlayback = useCallback(() => {
     heldRef.current = true;
     void playCtxRef.current?.suspend();
@@ -281,16 +291,6 @@ export function useCeeqVoice({ getToken, onToolCall, speed, onTurnEnd, onStudent
     setActivity((a) => (speaking ? "speaking" : a === "speaking" ? "idle" : a));
   }, []);
 
-  // The voice model speaks at about 155 words a minute whatever it is told,
-  // so its audio is stretched in time (pitch unchanged) to the chosen pace.
-  const stretcherRef = useRef<TimeStretcher | null>(null);
-  const speedRef = useRef(speed);
-  useEffect(() => {
-    speedRef.current = speed;
-    stretcherRef.current?.setSpeed(speed);
-  }, [speed]);
-  const getStretcher = useCallback(() => (stretcherRef.current ??= new TimeStretcher(PLAYBACK_SAMPLE_RATE, speedRef.current)), []);
-
   const stopPlayback = useCallback(() => {
     sourcesRef.current.forEach((src) => {
       try {
@@ -302,7 +302,6 @@ export function useCeeqVoice({ getToken, onToolCall, speed, onTurnEnd, onStudent
     sourcesRef.current = [];
     piecesRef.current = [];
     midTurnRef.current = false;
-    stretcherRef.current?.reset();
     nextStartRef.current = playCtxRef.current?.currentTime ?? 0;
     setSpeaking(false);
   }, [setSpeaking]);
@@ -359,15 +358,10 @@ export function useCeeqVoice({ getToken, onToolCall, speed, onTurnEnd, onStudent
           rest.count = 0;
         }
       }
-      schedule(getStretcher().process(pcm), from, turnSecondsRef.current);
+      schedule(pcm, from, turnSecondsRef.current);
     },
-    [getStretcher, schedule],
+    [schedule],
   );
-
-  /** Plays out the last few milliseconds the stretcher was holding back. */
-  const finishUtterance = useCallback(() => {
-    if (stretcherRef.current) schedule(stretcherRef.current.flush());
-  }, [schedule]);
 
   /** Takes back the current turn's queued speech from `seconds` into the turn onwards. */
   const cutSpeech = useCallback((seconds: number) => {
@@ -391,7 +385,6 @@ export function useCeeqVoice({ getToken, onToolCall, speed, onTurnEnd, onStudent
     }
     piecesRef.current = kept;
     if (cutAt !== null) nextStartRef.current = Math.max(ctx.currentTime, cutAt);
-    stretcherRef.current?.reset();
   }, []);
 
   // ---------- Idle pause ----------
@@ -400,7 +393,10 @@ export function useCeeqVoice({ getToken, onToolCall, speed, onTurnEnd, onStudent
   const pauseRef = useRef<() => void>(() => {});
   const touch = useCallback(() => {
     if (idleTimerRef.current) clearTimeout(idleTimerRef.current);
-    idleTimerRef.current = setTimeout(() => pauseRef.current(), IDLE_PAUSE_MS);
+    idleTimerRef.current = setTimeout(() => {
+      // A lesson the student has paused is not an idle one: it waits for them (see `hold`).
+      if (!heldRef.current) pauseRef.current();
+    }, IDLE_PAUSE_MS);
   }, []);
 
   // ---------- Server messages ----------
@@ -424,12 +420,11 @@ export function useCeeqVoice({ getToken, onToolCall, speed, onTurnEnd, onStudent
   /** The rest of the turn is not to be heard: cuts what must not play and ends the turn for the app. */
   const endSpeech = useCallback(
     (cut: Cut) => {
-      if (cut.at === null) finishUtterance();
       // Cut in a pause if she makes one near there; otherwise a little after, to be sure of her last word.
-      else cutSpeech(pauseNear(levelsRef.current, LEVEL_FRAME_SECONDS, cut.at) ?? cut.at + 0.25);
+      if (cut.at !== null) cutSpeech(pauseNear(levelsRef.current, LEVEL_FRAME_SECONDS, cut.at) ?? cut.at + 0.25);
       completeTurn(false);
     },
-    [completeTurn, cutSpeech, finishUtterance],
+    [completeTurn, cutSpeech],
   );
 
   /** Ceeq is now due to say something: an opening, a reply, or the next step. */
@@ -576,10 +571,7 @@ export function useCeeqVoice({ getToken, onToolCall, speed, onTurnEnd, onStudent
       // (A late signal about a turn already moved on from is not the end of the one now due.)
       if (content.generationComplete && serverTurnOpenRef.current) {
         const speech = getSpeech();
-        if (awaitedBegunRef.current || !speech.spoken) {
-          if (!speech.over) finishUtterance();
-          completeTurn(!speech.spoken);
-        }
+        if (awaitedBegunRef.current || !speech.spoken) completeTurn(!speech.spoken);
       }
 
       if (content.turnComplete) {
@@ -590,14 +582,11 @@ export function useCeeqVoice({ getToken, onToolCall, speed, onTurnEnd, onStudent
         movedOnAtRef.current = null;
         serverTurnOpenRef.current = false;
         newTurnRef.current = true;
-        if (!stale && (awaitedBegunRef.current || !speech.spoken)) {
-          if (!speech.over) finishUtterance();
-          completeTurn(!speech.spoken);
-        }
+        if (!stale && (awaitedBegunRef.current || !speech.spoken)) completeTurn(!speech.spoken);
         speech.endTurn();
       }
     },
-    [completeTurn, endSpeech, expectReply, finishUtterance, getSpeech, playSpeech, prepare, setHeard, showCaption, startedAnyway, stopPlayback, touch],
+    [completeTurn, endSpeech, expectReply, getSpeech, playSpeech, prepare, setHeard, showCaption, startedAnyway, stopPlayback, touch],
   );
 
   // ---------- Mic (hands-free) ----------
@@ -721,6 +710,10 @@ export function useCeeqVoice({ getToken, onToolCall, speed, onTurnEnd, onStudent
     sessionRef.current = null;
     closingRef.current = false;
     pendingPromptRef.current = null;
+    pendingTextRef.current = null;
+    if (parkTimerRef.current) clearTimeout(parkTimerRef.current);
+    parkTimerRef.current = null;
+    parkedRef.current = false;
     setActivity("idle");
     setHeard("");
   }, [forgetTurn, releasePlayback, setHeard, stopMic, stopPlayback]);
@@ -734,6 +727,51 @@ export function useCeeqVoice({ getToken, onToolCall, speed, onTurnEnd, onStudent
   useEffect(() => {
     statusRef.current = status;
   }, [status]);
+
+  // ---------- Pausing ----------
+  //
+  // The student can stop the lesson at any moment and carry on from the very
+  // word it stopped at, however much later: her voice is frozen, not dropped.
+  // A short pause keeps the connection. A long one closes it, since an open
+  // connection costs money and ends after ten minutes anyway; where the lesson
+  // had got to is kept here, and the app carries it over to a new connection
+  // when the student comes back (see `reconnect`).
+
+  /**
+   * Closes the connection of a lesson that stays as it is: what is queued to
+   * play, and where the conversation had got to, are kept.
+   */
+  const park = useCallback(() => {
+    if (statusRef.current !== "live" || parkedRef.current) return;
+    // Whatever connection there is, or is being opened, no longer counts.
+    generationRef.current++;
+    stopMic();
+    sessionRef.current?.close();
+    sessionRef.current = null;
+    closingRef.current = false;
+    toolAnsweredAtRef.current = null;
+    parkedRef.current = true;
+  }, [stopMic]);
+
+  /** The student pauses the lesson: Ceeq stops in the middle of her word. */
+  const hold = useCallback(() => {
+    holdPlayback();
+    if (parkTimerRef.current) clearTimeout(parkTimerRef.current);
+    parkTimerRef.current = setTimeout(park, PARK_AFTER_MS);
+  }, [holdPlayback, park]);
+
+  /**
+   * The student carries on: she goes on from the word she stopped at. True if
+   * the connection was closed meanwhile, in which case the app must carry the
+   * lesson over to a new one.
+   */
+  const release = useCallback(() => {
+    if (parkTimerRef.current) clearTimeout(parkTimerRef.current);
+    parkTimerRef.current = null;
+    releasePlayback();
+    if (statusRef.current === "live") touch();
+    return parkedRef.current;
+  }, [releasePlayback, touch]);
 
   useEffect(() => {
     pauseRef.current = pause;
@@ -757,9 +795,6 @@ export function useCeeqVoice({ getToken, onToolCall, speed, onTurnEnd, onStudent
         pauseRef.current();
       };
       if (serverTurnOpenRef.current && !turnEndedRef.current && awaitedBegunRef.current && !heldRef.current && now - lastServerAtRef.current > STALLED_MS) {
-        // The last few milliseconds are only worth playing if they follow straight on.
-        if (remainingMs() > 0) finishUtterance();
-        else stretcherRef.current?.reset();
         serverTurnOpenRef.current = false;
         // If she got to the end of a sentence, the turn can pass for finished. If not it stays
         // unfinished, and she is asked for the rest of it on the new connection.
@@ -785,7 +820,7 @@ export function useCeeqVoice({ getToken, onToolCall, speed, onTurnEnd, onStudent
       if (!silenceRef.current?.("no-reply", ++nudgesRef.current)) giveUp();
     }, WATCH_MS);
     return () => clearInterval(timer);
-  }, [status, completeTurn, finishUtterance, remainingMs]);
+  }, [status, completeTurn, remainingMs]);
 
   // While the mic is not feeding the service, silence is sent in its place (see HUSH_MS).
   useEffect(() => {
@@ -881,10 +916,16 @@ export function useCeeqVoice({ getToken, onToolCall, speed, onTurnEnd, onStudent
       closingRef.current = false;
       forgetTurn();
       start(session);
-      // What the app asked of her while there was no connection is asked now.
+      // What was asked of her while there was no connection is asked now. The student's own words come before the app's.
+      const typed = pendingTextRef.current;
       const waiting = pendingPromptRef.current;
+      pendingTextRef.current = null;
       pendingPromptRef.current = null;
-      if (waiting) {
+      if (typed) {
+        afterStudentRef.current = true;
+        expectReply();
+        session.sendRealtimeInput({ text: typed });
+      } else if (waiting) {
         expectReply();
         session.sendClientContent({ turns: [{ role: "user", parts: [{ text: waiting }] }], turnComplete: true });
       }
@@ -934,6 +975,7 @@ export function useCeeqVoice({ getToken, onToolCall, speed, onTurnEnd, onStudent
    * what she last said, without being asked to speak, unless something was
    * waiting on her (a reply she owed, or the rest of one she was cut off in):
    * then the student's words are put to her again, or the app's prompt is.
+   * It is also how a lesson paused for a long time gets its connection back.
    * False if the lesson is not running.
    */
   const reconnect = useCallback(
@@ -949,6 +991,7 @@ export function useCeeqVoice({ getToken, onToolCall, speed, onTurnEnd, onStudent
       sessionRef.current = null;
       old?.close();
       forgetTurn();
+      parkedRef.current = false;
       const start = (session: Session) => {
         const history = [
           { role: "user", parts: [{ text: carry.note }] },
@@ -980,7 +1023,17 @@ export function useCeeqVoice({ getToken, onToolCall, speed, onTurnEnd, onStudent
   const sendText = useCallback(
     (text: string) => {
       const trimmed = text.trim();
-      if (!sessionRef.current || !trimmed) return false;
+      if (!trimmed) return false;
+      if (!sessionRef.current) {
+        // Between connections, their words are kept and put to her as soon as the new one is open.
+        if (statusRef.current !== "live") return false;
+        pendingTextRef.current = trimmed;
+        stopPlayback();
+        studentInputRef.current?.();
+        setHeard(trimmed);
+        setActivity("thinking");
+        return true;
+      }
       // Typing over Ceeq cuts her off, like speaking over her.
       moveOn(true);
       stopPlayback();
@@ -995,9 +1048,14 @@ export function useCeeqVoice({ getToken, onToolCall, speed, onTurnEnd, onStudent
     [moveOn, setHeard, stopPlayback, touch],
   );
 
-  /** Tells Ceeq something from the app (e.g. a quiz result) without showing it as the student's words. */
+  /**
+   * Tells Ceeq something from the app (e.g. a quiz result) without showing it
+   * as the student's words. With `cut`, what she is saying now is dropped
+   * first: the app is taking the lesson somewhere else.
+   */
   const notify = useCallback(
-    (text: string) => {
+    (text: string, cut = false) => {
+      if (cut) stopPlayback();
       if (!sessionRef.current) {
         // Between connections, the prompt is kept and put to her as soon as the new one is open.
         if (statusRef.current !== "live") return false;
@@ -1009,7 +1067,7 @@ export function useCeeqVoice({ getToken, onToolCall, speed, onTurnEnd, onStudent
       touch();
       return true;
     },
-    [moveOn, touch],
+    [moveOn, stopPlayback, touch],
   );
 
   const end = useCallback(() => {
@@ -1026,6 +1084,7 @@ export function useCeeqVoice({ getToken, onToolCall, speed, onTurnEnd, onStudent
     () => () => {
       generationRef.current++;
       if (idleTimerRef.current) clearTimeout(idleTimerRef.current);
+      if (parkTimerRef.current) clearTimeout(parkTimerRef.current);
       sessionRef.current?.close();
       micStreamRef.current?.getTracks().forEach((track) => track.stop());
       void micCtxRef.current?.close();
@@ -1051,15 +1110,20 @@ export function useCeeqVoice({ getToken, onToolCall, speed, onTurnEnd, onStudent
     notify,
     stillHere,
     getLevel,
+    /** Whether a lesson is being connected right now (the status only says so after the next render). */
+    isStarting: () => startingRef.current === generationRef.current,
     /** Whether speech for a turn is still arriving from Ceeq, for use outside render. */
     isMidTurn: () => midTurnRef.current,
+    /** Whether Ceeq has been asked for something and has not yet begun to say it. */
+    isOwed: () => owedSinceRef.current !== null,
     /** Whether the mic is picking up a voice just now (or a noise as loud as one). */
     isHearingVoice: () => micStreamRef.current !== null && Date.now() - loudAtRef.current < VOICE_HANG_MS,
     /** The last thing Ceeq said, for use outside render. */
     lastWords: () => captionRef.current,
     remainingMs,
-    holdPlayback,
-    releasePlayback,
+    hold,
+    release,
+    park,
   };
 }
 

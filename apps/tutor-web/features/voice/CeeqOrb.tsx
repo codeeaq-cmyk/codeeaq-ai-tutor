@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useRef } from "react";
+import { LOGO_SRC } from "@/lib/brand";
 import type { VoiceActivity } from "./useCeeqVoice";
 
 const LABEL: Record<VoiceActivity, string> = {
@@ -10,7 +11,7 @@ const LABEL: Record<VoiceActivity, string> = {
   speaking: "Speaking",
 };
 
-/** Ceeq's presence: an orb that breathes, listens and moves with her voice in real time. */
+/** Ceeq's presence: her logo in an orb that breathes, listens and moves with her voice in real time. */
 export function CeeqOrb({
   activity,
   getLevel,
@@ -56,14 +57,18 @@ export function CeeqOrb({
         )}
         <div
           ref={coreRef}
-          className="absolute inset-0 rounded-full transition-transform duration-75"
+          className="absolute inset-0 overflow-hidden rounded-full transition-transform duration-75"
           style={{
+            // Seen until the logo has loaded, and through any clear parts of it.
             background: "radial-gradient(circle at 35% 30%, color-mix(in oklab, var(--accent) 55%, white), var(--accent) 70%)",
             transform: "scale(calc(1 + var(--level, 0) * 0.28))",
             boxShadow: "0 6px 24px -6px var(--accent)",
             animation: activity === "idle" ? "breathe 3.2s ease-in-out infinite" : undefined,
           }}
-        />
+        >
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img src={LOGO_SRC} alt="" className="h-full w-full object-cover" />
+        </div>
       </div>
       {showLabel && (
         <div className="leading-tight">

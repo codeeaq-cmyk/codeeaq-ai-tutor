@@ -32,16 +32,29 @@ function weakNote(progress: ModuleProgress | undefined, now: number): string {
   return ` They got these wrong before: ${items.join("; ")}. Take extra care over them, without mentioning that they got them wrong, and check them when you practise.`;
 }
 
-/** What Ceeq is told when the lesson connects. */
-export function openingFor(module: ModulePlan, progress: ModuleProgress | undefined, now = Date.now()): string {
+/**
+ * What Ceeq is told when the lesson connects. `part` is the part to start in:
+ * the one the student has reached, unless they chose the other with its button.
+ */
+export function openingFor(module: ModulePlan, progress: ModuleProgress | undefined, now = Date.now(), part: LessonMode = startingMode(progress)): string {
   const state = moduleState(progress);
+  const goals = module.goals.map((g, i) => `${i + 1}. ${g} — ${progress?.goals[i] ?? "todo"}`).join("; ");
+  const weak = weakNote(progress, now);
+  const reached = startingMode(progress);
+  if (part === "practice") {
+    if (state === "learning" && reached === "practice") {
+      return `(The student is back to continue this module. You have already explained all of it, so you are in part 2, practising. Goal status: ${goals}.${weak} Welcome them back in one short sentence, recap the module in two more, and ask a practice question on the first goal that is not understood. ${PACE_REMINDER})`;
+    }
+    // They chose to practise without the explanation, or without the rest of it.
+    const arrived = state === "new" ? "The student just opened this module" : "The student is back at this module";
+    return `(${arrived} and has asked to go straight to practice, without the explanation. Goal status: ${goals}.${weak} You are in part 2, practising. Begin by calling start_practice. Then ${state === "new" ? "greet them" : "welcome them back"} in one short sentence and ask a practice question on the first goal that is not understood. ${PACE_REMINDER})`;
+  }
   if (state === "new") {
     return `(The student just opened this module. Start with part 1, explaining. Give your opening turn as instructed: tools first, then greet them, say what this lesson is about, why it is worth learning and how the lesson will go. Do not ask them anything. ${PACE_REMINDER})`;
   }
-  const goals = module.goals.map((g, i) => `${i + 1}. ${g} — ${progress?.goals[i] ?? "todo"}`).join("; ");
-  const weak = weakNote(progress, now);
-  if (state === "learning" && startingMode(progress) === "practice") {
-    return `(The student is back to continue this module. You have already explained all of it, so you are in part 2, practising. Goal status: ${goals}.${weak} Welcome them back in one short sentence, recap the module in two more, and ask a practice question on the first goal that is not understood. ${PACE_REMINDER})`;
+  if (state === "learning" && reached === "practice") {
+    // They had heard the whole explanation, and have asked for it again.
+    return `(The student is back to continue this module and has asked to hear the explanation again before practising. Goal status: ${goals}.${weak} Start with part 1, explaining: tools first, then welcome them back in one short sentence and say you will go over it again. Explain the module once more, in one or two turns per goal. Do not ask them anything until you start practice. ${PACE_REMINDER})`;
   }
   if (state === "learning") {
     return `(The student is back to continue this module. You had not finished explaining it. Goal status: ${goals}.${weak} Start with part 1, explaining: tools first, then welcome them back in one short sentence and remind them what this lesson is about and why it matters. Then carry on explaining from the first goal you had not finished. Do not ask them anything. ${PACE_REMINDER})`;
@@ -49,6 +62,14 @@ export function openingFor(module: ModulePlan, progress: ModuleProgress | undefi
   const best = bestAttempt(progress);
   return `(The student is revisiting this module, which they have completed before.${best ? ` Their best quiz score so far is ${best.score} of ${best.total}.` : ""}${weak} Start with part 1, explaining: tools first, then welcome them back in one short sentence and say you will go over it again. Explain the module once more, briefly, in one or two turns per goal. Do not ask them anything until you start practice. ${PACE_REMINDER})`;
 }
+
+// What Ceeq is told when the student moves a running lesson to another part with its button.
+
+/** Back to the explanation, from practice or from the quiz. */
+export const EXPLAIN_AGAIN = `(The student has pressed the button to go back to the explanation. You are in part 1 again. Explain this module once more from its first goal, in short turns as before: tools first, then one short paragraph, after which the app asks you to carry on. Do not ask them anything. When every goal has been explained again, give your last explaining turn as usual, starting with start_practice. ${PACE_REMINDER})`;
+
+/** On to practice, from the explanation or from the quiz. */
+export const PRACTISE_NOW = `(The student has pressed the button to go to practice. You are in part 2 now. Begin this turn by calling start_practice. Then say in one short sentence that you will practise together, ask one practice question on the first goal they have not yet shown they understand, and wait for their answer. ${PACE_REMINDER})`;
 
 /**
  * What Ceeq is told when a revision lesson connects. Her instructions already

@@ -1,13 +1,20 @@
 import Link from "next/link";
 import type { ButtonHTMLAttributes, ReactNode } from "react";
+import { LOGO_SRC } from "@/lib/brand";
+
+/** The Ceeq logo, as a small square mark. Beside the name it needs no words of its own. */
+export function Logo({ size = 24, className = "" }: { size?: number; className?: string }) {
+  return (
+    // A small local picture, shown as it is: next/image adds nothing here.
+    // eslint-disable-next-line @next/next/no-img-element
+    <img src={LOGO_SRC} alt="" width={size} height={size} className={`shrink-0 rounded-md object-contain ${className}`} style={{ width: size, height: size }} />
+  );
+}
 
 export function Wordmark({ href = "/learn" }: { href?: string }) {
   return (
     <Link href={href} className="flex items-center gap-2 font-semibold tracking-tight">
-      <span
-        className="h-5 w-5 rounded-full"
-        style={{ background: "radial-gradient(circle at 35% 30%, color-mix(in oklab, var(--accent) 55%, white), var(--accent) 70%)" }}
-      />
+      <Logo />
       ceeq
     </Link>
   );
@@ -64,7 +71,7 @@ export function ProgressRing({ value, size = 28 }: { value: number; size?: numbe
   );
 }
 
-export function Icon({ name, className = "h-5 w-5" }: { name: "back" | "mic" | "mic-off" | "send" | "chevron" | "check" | "stop" | "pause" | "play" | "user"; className?: string }) {
+export function Icon({ name, className = "h-5 w-5" }: { name: "back" | "mic" | "mic-off" | "send" | "chevron" | "check" | "stop" | "pause" | "play" | "user" | "transcript"; className?: string }) {
   const paths: Record<typeof name, ReactNode> = {
     back: <path d="M15 18l-6-6 6-6" />,
     chevron: <path d="M9 18l6-6-6-6" />,
@@ -73,6 +80,12 @@ export function Icon({ name, className = "h-5 w-5" }: { name: "back" | "mic" | "
     stop: <rect x="6" y="6" width="12" height="12" rx="2" />,
     pause: <path d="M9 5v14M15 5v14" />,
     play: <path d="M8 5l11 7-11 7z" />,
+    transcript: (
+      <>
+        <rect x="3" y="5" width="18" height="14" rx="2" />
+        <path d="M7 10h6M7 14h10" />
+      </>
+    ),
     user: (
       <>
         <circle cx="12" cy="8" r="4" />

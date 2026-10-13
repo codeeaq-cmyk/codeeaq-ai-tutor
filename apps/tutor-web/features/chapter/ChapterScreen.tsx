@@ -11,7 +11,7 @@ import {
   type ModuleState,
   type WeakGoal,
 } from "@codeeaq/shared-types";
-import { Icon, ProgressRing } from "@/features/ui";
+import { Icon, Logo, ProgressRing } from "@/features/ui";
 import { useChapterPlan } from "@/lib/course";
 import { useChapterProgress } from "@/lib/progress";
 import { dayLabel } from "@/lib/revise";
@@ -62,6 +62,9 @@ function Chapter({ target }: { target: ChapterTarget }) {
             <ProgressRing value={chapterMastery(progress)} size={26} />
           </div>
         )}
+        <Link href="/learn" className="mt-0.5 shrink-0" aria-label="Ceeq: all subjects">
+          <Logo size={28} />
+        </Link>
       </header>
 
       {state.status === "loading" ? (

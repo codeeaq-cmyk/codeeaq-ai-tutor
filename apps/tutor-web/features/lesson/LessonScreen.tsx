@@ -27,20 +27,21 @@ import {
 import { Board } from "@/features/board/Board";
 import { Missing } from "@/features/chapter/ChapterScreen";
 import { QuizView, type QuizResult } from "@/features/quiz/QuizView";
-import { Icon, PrimaryButton } from "@/features/ui";
+import { Icon, Logo, PrimaryButton } from "@/features/ui";
 import { CeeqOrb } from "@/features/voice/CeeqOrb";
 import { useCeeqVoice, type ToolHandler } from "@/features/voice/useCeeqVoice";
 import { loadQuiz, prefetchQuiz, useChapterPlan } from "@/lib/course";
 import { startVoice } from "@/lib/firebase";
-import { usePace } from "@/lib/pace";
 import { readChapterProgress, savePlan, updateModule, useChapterProgress } from "@/lib/progress";
 import { dayLabel, reasonFor } from "@/lib/revise";
 import { useChapterTarget, type ChapterRouteProps, type ChapterTarget } from "@/lib/target";
+import { useTranscript } from "@/lib/transcript";
 import {
   CARRY_ON,
   carryOnLimit,
   carryOverNote,
   Evidence,
+  EXPLAIN_AGAIN,
   GAP_AFTER_STUDENT_MS,
   GO_ON,
   goalInHand,
@@ -50,6 +51,7 @@ import {
   MAX_RECONNECTS,
   MAX_SILENT_TURNS,
   openingFor,
+  PRACTISE_NOW,
   QUIZ_SHOWN,
   quizReport,
   quizResultPrompt,
@@ -145,9 +147,9 @@ function ModuleLesson({ target, plan, index, provisional, startWithQuiz, topics 
   /** The time by which "due" is judged; moved on when the student does something that adds to the list. */
   const [clock, setClock] = useState(() => Date.now());
 
-  // Which spoken part the lesson is in, and whether the student has paused the
-  // explanation. Each is kept in a ref as well, because the voice callbacks
-  // below run outside render and must see the value as it is now.
+  // Which spoken part the lesson is in, and whether the student has paused
+  // it. Each is kept in a ref as well, because the voice callbacks below run
+  // outside render and must see the value as it is now.
   const [mode, setModeState] = useState<LessonMode>(revising ? "practice" : "explain");
   const [paused, setPausedState] = useState(false);
   const flow = useRef({
@@ -169,6 +171,8 @@ function ModuleLesson({ target, plan, index, provisional, startWithQuiz, topics 
     quizReport: null as string | null,
     /** Ceeq has been told the quiz result and has not yet said anything to it. */
     resultDue: false,
+    /** Ceeq has ended the lesson herself and sent the student to the quiz: a part gone back to now starts afresh. */
+    finished: false,
   });
   // What the student has said in this sitting, which Ceeq's judgements must rest on.
   const evidence = useRef(new Evidence());
@@ -291,6 +295,11 @@ function ModuleLesson({ target, plan, index, provisional, startWithQuiz, topics 
             goals: m.goals.map((g) => (g === "practice" ? g : "understood")),
           }));
           setMode("practice");
+          flow.current.finished = true;
+          // The quiz she sends them to is a new attempt, whatever they did at it earlier in this sitting.
+          flow.current.quizReport = null;
+          flow.current.resultDue = false;
+          setQuizTaken(false);
           setView("quiz");
           return { ok: true, note: "The quiz is now on the student's screen. Wish them luck in one short sentence, then stay silent until you are told the result." };
         case "finish_revision": {
@@ -305,10 +314,10 @@ function ModuleLesson({ target, plan, index, provisional, startWithQuiz, topics 
           return { ok: false, error: "Unknown tool" };
       }
     },
-    [target.key, mod, topics, revising, setMode, setView],
+    [target.key, mod, topics, revising, setMode, setQuizTaken, setView],
   );
 
-  const { pace, nextPace } = usePace();
+  const { transcript, toggleTranscript } = useTranscript();
 
   // ---------- Keeping the explanation going ----------
   //
@@ -406,19 +415,25 @@ function ModuleLesson({ target, plan, index, provisional, startWithQuiz, topics 
   );
 
   // When the student speaks or types, hold the prompt back (Ceeq will answer
-  // them first), and un-pause so that her answer can be heard.
+  // them first). If they type while the lesson is paused, it carries on, so
+  // that her answer can be heard.
   const onStudentInput = useCallback(() => {
     evidence.current.studentSpoke();
     cancelCarryOn();
     flow.current.held = 0;
     if (!flow.current.paused) return;
     setPaused(false);
-    voiceRef.current?.releasePlayback();
-  }, [cancelCarryOn, setPaused]);
+    if (voiceRef.current?.release()) carryOver(voiceRef.current);
+  }, [cancelCarryOn, carryOver, setPaused]);
 
-  /** Connects and begins the lesson in the part the student has reached, or the revision. */
+  /**
+   * Connects and begins the lesson, or the revision. A lesson begins in the
+   * part the student has reached, unless they chose a part with its button.
+   */
   const begin = useCallback(
-    (voiceNow: ReturnType<typeof useCeeqVoice>) => {
+    (voiceNow: ReturnType<typeof useCeeqVoice>, part?: LessonMode) => {
+      // One start at a time: the page may be starting the lesson by itself just as the student presses a button.
+      if (voiceNow.isStarting()) return;
       const saved = readChapterProgress(target.key)?.modules[mod.id];
       const settled = flow.current.settled;
       cancelCarryOn();
@@ -429,6 +444,7 @@ function ModuleLesson({ target, plan, index, provisional, startWithQuiz, topics 
       flow.current.noisy = false;
       flow.current.quizReport = null;
       flow.current.resultDue = false;
+      flow.current.finished = false;
       setQuizTaken(false);
       // A new connection is a new conversation: nothing has been said in it yet.
       evidence.current = new Evidence();
@@ -444,7 +460,7 @@ function ModuleLesson({ target, plan, index, provisional, startWithQuiz, topics 
         void voiceNow.connect(revisionOpening(topics.filter((t) => settled.has(t.index)).map((t) => t.index + 1)));
         return;
       }
-      const startIn = startingMode(saved);
+      const startIn = part ?? startingMode(saved);
       settled.clear();
       // Resuming practice: the goals settled last time are not asked again.
       if (startIn === "practice") {
@@ -453,7 +469,7 @@ function ModuleLesson({ target, plan, index, provisional, startWithQuiz, topics 
         });
       }
       setMode(startIn);
-      void voiceNow.connect(openingFor(mod, saved));
+      void voiceNow.connect(openingFor(mod, saved, Date.now(), startIn));
     },
     [cancelCarryOn, mod, topics, setMode, setPaused, setQuizTaken, setView, target.key],
   );
@@ -478,6 +494,11 @@ function ModuleLesson({ target, plan, index, provisional, startWithQuiz, topics 
           return true;
         }
       }
+      // A paused lesson needs no connection until the student carries on, and is given one then.
+      if (flow.current.paused) {
+        voiceNow.park();
+        return true;
+      }
       // A connection replaced on notice is no failure. One that was lost counts towards the limit.
       if (why !== "closing") {
         if (flow.current.reconnects >= MAX_RECONNECTS) return false;
@@ -488,7 +509,7 @@ function ModuleLesson({ target, plan, index, provisional, startWithQuiz, topics 
     [carryOn, carryOver],
   );
 
-  const voice = useCeeqVoice({ getToken, onToolCall, speed: pace.speed, onTurnEnd, onStudentInput, onSilence });
+  const voice = useCeeqVoice({ getToken, onToolCall, onTurnEnd, onStudentInput, onSilence });
   useEffect(() => {
     voiceRef.current = voice;
   });
@@ -498,8 +519,9 @@ function ModuleLesson({ target, plan, index, provisional, startWithQuiz, topics 
   // The quiz is taken in silence. Until it is finished Ceeq does not listen, so that
   // nothing said over it, by the student or anyone else in the room, is taken for an
   // answer, and she is not tempted to announce a result nobody has given her.
+  // Nor does she listen while the lesson is paused.
   const { setHearing } = voice;
-  const listening = view !== "quiz" || quizTaken;
+  const listening = !paused && (view !== "quiz" || quizTaken);
   useEffect(() => setHearing(listening), [listening, setHearing]);
 
   // A safety net: if she should be explaining and nothing at all is happening
@@ -517,19 +539,77 @@ function ModuleLesson({ target, plan, index, provisional, startWithQuiz, topics 
 
   const start = useCallback(() => begin(voice), [begin, voice]);
 
-  /** Freezes the explanation mid-sentence, or picks it up exactly where it stopped. */
-  const togglePause = useCallback(() => {
-    if (flow.current.paused) {
-      setPaused(false);
-      voice.releasePlayback();
-      // Her turn had finished arriving before the pause, so nothing else will prompt her.
-      if (!voice.isMidTurn()) carryOnTimer.current = setTimeout(carryOn, Math.max(0, voice.remainingMs() - LEAD_MS));
-    } else {
-      setPaused(true);
-      cancelCarryOn();
-      voice.holdPlayback();
+  // ---------- Pausing, and moving between the parts ----------
+  //
+  // The student can pause the lesson in any part, and it carries on from the
+  // very word it stopped at. Going to the quiz of their own accord pauses it
+  // in the same way; coming back carries it on. Pressing a part the lesson is
+  // not in takes it there: Ceeq is told, and starts that part.
+
+  /** Freezes the lesson where it is: Ceeq stops in the middle of her word, and stops listening. */
+  const pauseLesson = useCallback(() => {
+    if (flow.current.paused) return;
+    setPaused(true);
+    cancelCarryOn();
+    voice.hold();
+  }, [cancelCarryOn, setPaused, voice]);
+
+  /** Carries on from exactly where the lesson was paused, however long ago. */
+  const resumeLesson = useCallback(() => {
+    if (!flow.current.paused) return;
+    setPaused(false);
+    // If something is already on its way from her, its end will see that she is asked to carry on.
+    const coming = voice.isMidTurn() || voice.isOwed();
+    // After a long pause the connection is gone: the lesson carries on over a new one.
+    if (voice.release()) carryOver(voice);
+    if (!coming) carryOnTimer.current = setTimeout(carryOn, Math.max(0, voice.remainingMs() - LEAD_MS));
+  }, [carryOn, carryOver, setPaused, voice]);
+
+  const togglePause = useCallback(() => (flow.current.paused ? resumeLesson() : pauseLesson()), [pauseLesson, resumeLesson]);
+
+  /** The student goes to the quiz of their own accord: the lesson waits for them where it is. */
+  const openQuiz = useCallback(() => {
+    if (flow.current.view === "quiz") return;
+    if (voice.status === "live" && flow.current.view === "lesson") pauseLesson();
+    // A quiz opened afresh is a new attempt.
+    flow.current.quizReport = null;
+    flow.current.resultDue = false;
+    setQuizTaken(false);
+    setView("quiz");
+  }, [pauseLesson, setView, voice.status]);
+
+  /** Back from the quiz to the lesson, which carries on from where it stopped. */
+  const backToLesson = useCallback(() => {
+    setView("lesson");
+    if (flow.current.paused) return resumeLesson();
+    // It was not paused (they typed to her from the quiz, say), so nothing else will ask her to carry on.
+    if (voice.status === "live" && !carryOnTimer.current && !voice.isMidTurn() && !voice.isOwed()) {
+      carryOnTimer.current = setTimeout(carryOn, Math.max(0, voice.remainingMs() - LEAD_MS));
     }
-  }, [cancelCarryOn, carryOn, setPaused, voice]);
+  }, [carryOn, resumeLesson, setView, voice]);
+
+  /** The student presses one of the three parts: the lesson goes there. */
+  const goToPart = useCallback(
+    (part: Part) => {
+      if (part === "quiz") return openQuiz();
+      // Not running: the lesson starts in that part.
+      if (voice.status !== "live") return begin(voice, part);
+      // Already in that part (they are coming back from the quiz, or it is paused): it carries on.
+      if (flow.current.mode === part && !flow.current.finished) return backToLesson();
+      // Otherwise Ceeq is told to change part, and what she was saying is dropped.
+      cancelCarryOn();
+      flow.current.finished = false;
+      flow.current.prompts = 0;
+      setMode(part);
+      if (part === "practice") evidence.current.practiceBegan();
+      setView("lesson");
+      const parked = flow.current.paused && voice.release();
+      setPaused(false);
+      if (parked) carryOver(voice);
+      voice.notify(part === "explain" ? EXPLAIN_AGAIN : PRACTISE_NOW, true);
+    },
+    [backToLesson, begin, cancelCarryOn, carryOver, openQuiz, setMode, setPaused, setView, voice],
+  );
 
   // On arrival: keep a single-lesson fallback plan so progress can be saved,
   // start writing the quiz so it is ready when the lesson ends, and mint the
@@ -575,8 +655,10 @@ function ModuleLesson({ target, plan, index, provisional, startWithQuiz, topics 
       const report = quizReport(result.score, result.total, result.missed);
       flow.current.quizReport = report;
       setQuizTaken(true);
-      // False when the lesson is not running: then there is nobody to tell.
-      flow.current.resultDue = voice.notify(quizResultPrompt(report));
+      // A student who went to the quiz in the middle of the lesson left it paused: Ceeq says nothing of the
+      // result, and the lesson carries on where it stopped when they go back. Nor is there anyone to tell
+      // when the lesson is not running.
+      flow.current.resultDue = !flow.current.paused && voice.notify(quizResultPrompt(report));
     },
     [target.key, mod.id, voice],
   );
@@ -602,13 +684,16 @@ function ModuleLesson({ target, plan, index, provisional, startWithQuiz, topics 
   // Before the lesson is running, show the part it will start in.
   const part: Part = view === "quiz" ? "quiz" : live || busy ? mode : startingMode(progress);
   const explaining = live && view === "lesson" && mode === "explain";
-  const hint =
-    !live || view !== "lesson"
-      ? null
-      : revising
-        ? "Ceeq goes over each topic, then asks you about it. Answer out loud, or type."
-        : paused
-          ? "Paused. Press play to carry on."
+  const hint = !live
+    ? null
+    : view !== "lesson"
+      ? view === "quiz" && paused
+        ? `The lesson is paused while you are at the quiz. Go back to ${revising ? "the whiteboard" : PARTS.find((p) => p.id === mode)?.label} and it carries on from where it stopped.`
+        : null
+      : paused
+        ? "Paused. Press play to carry on from where it stopped."
+        : revising
+          ? "Ceeq goes over each topic, then asks you about it. Answer out loud, or type."
           : mode === "explain"
             ? "Ceeq is explaining. Ask a question any time."
             : "Your turn. Answer out loud, or type.";
@@ -628,14 +713,16 @@ function ModuleLesson({ target, plan, index, provisional, startWithQuiz, topics 
 
   const viewToggle =
     view === "lesson" ? (
-      <button onClick={() => setView("quiz")} className="w-full rounded-xl border border-line px-4 py-2.5 text-sm font-medium hover:border-muted">
+      <button onClick={openQuiz} className="w-full rounded-xl border border-line px-4 py-2.5 text-sm font-medium hover:border-muted">
         {best ? "Retake the quiz" : "Take the quiz"}
       </button>
     ) : (
-      <button onClick={() => setView("lesson")} className="w-full rounded-xl border border-line px-4 py-2.5 text-sm font-medium hover:border-muted">
+      <button onClick={backToLesson} className="w-full rounded-xl border border-line px-4 py-2.5 text-sm font-medium hover:border-muted">
         Back to the whiteboard
       </button>
     );
+  const parts = !revising && <Parts current={part} onSelect={goToPart} disabled={busy} />;
+  const transcriptToggle = <TranscriptToggle on={transcript} onToggle={toggleTranscript} />;
 
   return (
     <div className="flex h-dvh flex-col">
@@ -646,7 +733,6 @@ function ModuleLesson({ target, plan, index, provisional, startWithQuiz, topics 
         <div className="min-w-0 flex-1">
           <div className="truncate text-xs text-muted">
             {target.chapter} · {topics ? `Revision · ${topics.length === 1 ? "1 topic" : `${topics.length} topics`}` : `Module ${index + 1} of ${plan.modules.length}`}
-            {!revising && <span className="lg:hidden"> · {PARTS.find((p) => p.id === part)?.label}</span>}
           </div>
           <h1 className="truncate font-semibold">{mod.title}</h1>
         </div>
@@ -655,15 +741,15 @@ function ModuleLesson({ target, plan, index, provisional, startWithQuiz, topics 
             Best quiz <span className="font-medium text-fg tabular-nums">{best.score}/{best.total}</span>
           </span>
         )}
-        <button
-          onClick={nextPace}
-          className="shrink-0 rounded-lg border border-line px-2.5 py-1.5 text-sm text-muted hover:border-muted hover:text-fg"
-          title="How fast Ceeq speaks. Click to change."
-          aria-label={`Ceeq's speaking pace: ${pace.label}. Click to change.`}
-        >
-          Pace: <span className="font-medium text-fg">{pace.label}</span>
-        </button>
+        {/* On wide screens the logo is Ceeq herself, in her panel. */}
+        <Logo size={28} className="lg:hidden" />
       </header>
+
+      {/* On wide screens these live in Ceeq's panel. */}
+      <div className="flex items-center justify-between gap-2 overflow-x-auto border-b border-line bg-surface px-3 py-2 sm:px-5 lg:hidden">
+        {parts || <span />}
+        {transcriptToggle}
+      </div>
 
       <div className="flex min-h-0 flex-1">
         <section className="min-w-0 flex-1 overflow-y-auto bg-surface" aria-label={view === "quiz" ? "Quiz" : view === "done" ? "Revision summary" : "Whiteboard"}>
@@ -674,7 +760,7 @@ function ModuleLesson({ target, plan, index, provisional, startWithQuiz, topics 
               onFinished={onQuizFinished}
               onActivity={voice.stillHere}
               // From a revision, "revisit the lesson" means the whole lesson, which is another page.
-              onRevisitLesson={revising ? () => router.push(target.href(mod.id)) : live ? () => setView("lesson") : start}
+              onRevisitLesson={revising ? () => router.push(target.href(mod.id)) : live ? backToLesson : start}
               next={next}
               revise={toRevise ? { href: target.href(mod.id, { revise: true }), count: toRevise } : undefined}
             />
@@ -688,7 +774,7 @@ function ModuleLesson({ target, plan, index, provisional, startWithQuiz, topics 
                 <Link href={target.href()} onClick={voice.end} className="inline-flex items-center gap-2 rounded-xl bg-accent px-5 py-3 font-semibold text-accent-fg shadow-sm hover:opacity-90">
                   Back to chapter <Icon name="chevron" className="h-4 w-4" />
                 </Link>
-                <button onClick={() => setView("quiz")} className="rounded-xl border border-line bg-surface px-4 py-3 font-medium hover:border-muted">
+                <button onClick={openQuiz} className="rounded-xl border border-line bg-surface px-4 py-3 font-medium hover:border-muted">
                   {best ? "Retake the quiz" : "Take the quiz"}
                 </button>
               </div>
@@ -712,11 +798,20 @@ function ModuleLesson({ target, plan, index, provisional, startWithQuiz, topics 
             hint && <p className="text-sm text-muted">{hint}</p>
           ) : (
             <div>
-              <Parts current={part} />
+              {parts}
               {hint && <p className="mt-2.5 text-sm text-muted">{hint}</p>}
             </div>
           )}
-          {voice.caption && <p className="text-[15px] leading-relaxed text-muted">{voice.caption}</p>}
+          {/* What Ceeq says is for listening to. It is written out only if the student asks. */}
+          <div>
+            {transcriptToggle}
+            {transcript &&
+              (voice.caption ? (
+                <p className="mt-3 text-[15px] leading-relaxed text-muted">{voice.caption}</p>
+              ) : (
+                <p className="mt-3 text-sm text-muted">What Ceeq says will be written here.</p>
+              ))}
+          </div>
           {/* Once a revision is done the main panel shows how each topic went. */}
           {topics ? view !== "done" && topicList : <Goals module={mod} statuses={goals} due={dueGoals(progress, clock).map((g) => g.index)} />}
           {progress && progress.correct + progress.incorrect > 0 && (
@@ -731,7 +826,9 @@ function ModuleLesson({ target, plan, index, provisional, startWithQuiz, topics 
       {/* On wide screens the start button lives in Ceeq's panel, so the bar only shows during a lesson. */}
       <footer className={`border-t border-line bg-surface px-3 py-3 sm:px-5 ${live ? "" : "lg:hidden"}`}>
         {notice && <p className={`mb-2 text-sm text-muted ${live ? "text-center" : "text-right"}`}>{notice}</p>}
-        {live && voice.caption && view === "lesson" && (
+        {/* On wide screens Ceeq's panel says so. */}
+        {live && paused && hint && <p className="mb-2 text-center text-sm text-muted lg:hidden">{hint}</p>}
+        {live && transcript && voice.caption && view === "lesson" && (
           <p className="mx-auto mb-2 line-clamp-2 max-w-3xl px-1 text-sm text-muted lg:hidden">{voice.caption}</p>
         )}
         {live ? (
@@ -761,12 +858,12 @@ function ModuleLesson({ target, plan, index, provisional, startWithQuiz, topics 
                 <Icon name="send" className="h-4 w-4" />
               </button>
             </form>
-            {explaining && (
+            {view === "lesson" && (
               <button
                 onClick={togglePause}
                 className={`grid h-11 w-11 shrink-0 place-items-center rounded-full transition-colors ${paused ? "bg-accent text-accent-fg" : "text-muted hover:bg-surface-2 hover:text-fg"}`}
-                aria-label={paused ? "Carry on with the explanation" : "Pause the explanation"}
-                title={paused ? "Carry on" : "Pause"}
+                aria-label={paused ? `Carry on with the ${revising ? "revision" : "lesson"}` : `Pause the ${revising ? "revision" : "lesson"}`}
+                title={paused ? "Carry on from where it stopped" : "Pause"}
               >
                 <Icon name={paused ? "play" : "pause"} />
               </button>
@@ -795,31 +892,54 @@ function ModuleLesson({ target, plan, index, provisional, startWithQuiz, topics 
 
 type Part = LessonMode | "quiz";
 
-const PARTS: { id: Part; label: string }[] = [
-  { id: "explain", label: "Explain" },
-  { id: "practice", label: "Practise" },
-  { id: "quiz", label: "Quiz" },
+const PARTS: { id: Part; label: string; go: string }[] = [
+  { id: "explain", label: "Explain", go: "Hear Ceeq explain this module" },
+  { id: "practice", label: "Practise", go: "Practise with Ceeq" },
+  { id: "quiz", label: "Quiz", go: "Take the quiz" },
 ];
 
-/** The three parts of a module, with the current one marked. */
-function Parts({ current }: { current: Part }) {
+/** The three parts of a module, with the current one marked. Pressing one takes the lesson there. */
+function Parts({ current, onSelect, disabled }: { current: Part; onSelect: (part: Part) => void; disabled: boolean }) {
   const at = PARTS.findIndex((p) => p.id === current);
   return (
-    <ol className="flex items-center gap-1.5 text-sm" aria-label="Parts of this lesson">
+    <ol className="flex items-center gap-1 text-sm sm:gap-1.5" aria-label="Parts of this lesson">
       {PARTS.map((p, i) => (
-        <li key={p.id} className="flex items-center gap-1.5" aria-current={i === at ? "step" : undefined}>
-          {i > 0 && <span className="h-px w-4 bg-line" aria-hidden />}
-          <span
-            className={`flex items-center gap-1.5 rounded-full px-2.5 py-1 ${
-              i === at ? "bg-accent font-medium text-accent-fg" : i < at ? "text-fg" : "text-muted"
+        <li key={p.id} className="flex items-center gap-1 sm:gap-1.5" aria-current={i === at ? "step" : undefined}>
+          {i > 0 && <span className="h-px w-2 bg-line sm:w-4" aria-hidden />}
+          <button
+            type="button"
+            onClick={() => onSelect(p.id)}
+            disabled={disabled}
+            title={p.go}
+            className={`flex items-center gap-1.5 rounded-full px-2.5 py-1 transition-colors disabled:opacity-50 ${
+              i === at ? "bg-accent font-medium text-accent-fg" : `hover:bg-surface-2 hover:text-fg ${i < at ? "text-fg" : "text-muted"}`
             }`}
           >
             {i < at ? <Icon name="check" className="h-3.5 w-3.5" /> : <span className="tabular-nums">{i + 1}</span>}
             {p.label}
-          </span>
+          </button>
         </li>
       ))}
     </ol>
+  );
+}
+
+/** Turns the written version of what Ceeq says on or off. */
+function TranscriptToggle({ on, onToggle }: { on: boolean; onToggle: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onToggle}
+      aria-pressed={on}
+      aria-label="Transcript of what Ceeq says"
+      title={on ? "Hide what Ceeq is saying" : "Show what Ceeq is saying, in writing"}
+      className={`inline-flex shrink-0 items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-sm text-muted transition-colors hover:text-fg ${on ? "border-accent" : "border-line hover:border-muted"}`}
+    >
+      <Icon name="transcript" className="h-4 w-4" />
+      {/* On a phone there is room for the picture and the word after it only. */}
+      <span className="hidden sm:inline">Transcript:</span>
+      <span className="font-medium text-fg">{on ? "On" : "Off"}</span>
+    </button>
   );
 }
 
