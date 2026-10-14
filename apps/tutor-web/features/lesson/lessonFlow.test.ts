@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { emptyModuleProgress, markMissed, type ModulePlan, type ModuleProgress } from "@codeeaq/shared-types";
-import { carryOnLimit, carryOverNote, Evidence, goalInHand, openingFor, quizReport, quizResultPrompt, revisionOpening, startingMode } from "./lessonFlow";
+import { carryOnLimit, carryOverNote, checkIn, Evidence, goalInHand, howLong, openingFor, quizReport, quizResultPrompt, revisionOpening, startingMode, welcomeBack } from "./lessonFlow";
 
 const plan: ModulePlan = { id: "m", title: "Ohm's law", goals: ["State the law", "Calculate resistance"] };
 const fresh = emptyModuleProgress(2);
@@ -189,5 +189,35 @@ describe("carryOnLimit", () => {
   it("allows more prompts for modules with more goals", () => {
     expect(carryOnLimit(2)).toBe(14);
     expect(carryOnLimit(4)).toBeGreaterThan(carryOnLimit(2));
+  });
+});
+
+describe("the student out of view", () => {
+  it("has Ceeq check in, saying what the camera showed, and wait", () => {
+    const explaining = checkIn("away", "explain");
+    expect(explaining).toContain("has not been in front of the camera");
+    expect(explaining).toContain("Do not go on explaining");
+    expect(explaining).toContain("wait for them");
+    const practising = checkIn("turned", "practice");
+    expect(practising).toContain("turned away from the screen");
+    expect(practising).toContain("put it to them again");
+    for (const note of [explaining, practising]) expect(note).toContain("Do not scold them");
+  });
+
+  it("says roughly how long the student was away", () => {
+    expect(howLong(4_000)).toBe("about 10 seconds");
+    expect(howLong(31_000)).toBe("about 30 seconds");
+    expect(howLong(70_000)).toBe("about a minute");
+    expect(howLong(150_000)).toBe("about 3 minutes");
+  });
+
+  it("has her welcome them back and pick up the thread of the part they are in", () => {
+    const explaining = welcomeBack(70_000, "explain", false);
+    expect(explaining).toContain("was away from the screen for about a minute");
+    expect(explaining).toContain("recap in one sentence");
+    expect(explaining).toContain("carry on explaining");
+    const practising = welcomeBack(200_000, "practice", true);
+    expect(practising).toContain("left the lesson for another app for about 3 minutes");
+    expect(practising).toContain("put it to them again");
   });
 });

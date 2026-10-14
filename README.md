@@ -63,6 +63,7 @@ The Ceeq logo is one picture, `apps/tutor-web/public/logo-cq.svg`. The page head
 10. **Progress.** Goals, answers, misconceptions and quiz attempts are saved per module and fed back when the student returns, so Ceeq continues where they left off. The app works from a copy on the device, kept under the student's id, so everything shows at once. Each change is also saved to their account in Firestore (`students/{uid}` and `students/{uid}/chapters/{chapter}`, `apps/tutor-web/lib/sync.ts`); at sign-in the two copies are combined, the later change winning, so progress follows the student to any device.
 11. **Weak spots.** A wrong spoken answer, or a missed quiz question, marks the goal it was about as a weak spot, with a note of what went wrong (`packages/shared-types/src/revision.ts`). The home page reminds the student what they have to revise across every subject, and the chapter page marks the modules concerned.
 12. **Revision.** "Revise" opens a short lesson on one module's weak spots. Ceeq is given only those goals and what went wrong, explains each again in a different way and checks it with a question; the app waits for the student throughout. A goal the student now gets right is checked once more three days later and comes off the list when that check is passed; a wrong answer at any point puts it back.
+13. **The camera.** A lesson needs the student's camera, so that Ceeq can tell whether they are with her; without it Start does not begin the lesson. What the camera shows never leaves the device and nothing is recorded: Google's MediaPipe face detector runs in the browser twice a second (`apps/tutor-web/features/attention/`; its 230 KB model is in `public/models`, its 3.5 MB engine comes from jsDelivr and is cached for a year) and reports only whether a face is facing the screen, has turned well aside, or is not there. Looking down to write notes counts as being there. Out of view for 20 seconds, Ceeq checks in with one kind sentence (while explaining, in place of her next step; in conversation, as soon as she has finished speaking) and the lesson waits for the student. Out of view for a minute, the lesson pauses, and carries on when they are back in view, Ceeq welcoming them back and recapping her last point. Going to another app or tab pauses the lesson at once; coming back carries it on, with a welcome only after 20 seconds or more away. If the camera goes off, the lesson pauses until it is turned back on. Speaking or typing always counts as being there. Only Ceeq is told any of this, in the moment; none of it is stored. The student sees their own picture, ringed green when they are in view and amber when not. The camera is turned off when the lesson ends.
 
 Reminders outside the app (text or push), limits on misuse (App Check, per-student rate limits) and RAG over textbooks come next.
 
@@ -111,7 +112,7 @@ Phase 1 is an MVP. It should prove the complete teaching loop before adding adva
 
 ## Explicitly NOT included in Phase 1
 
-- Continuous camera monitoring
+- Recording, storing or sending camera video (the camera is now used during lessons, but only on the student's device and only to tell whether they are in view: see item 13 under how the app works)
 - Emotion detection
 - Facial-expression analysis
 - Handwriting recognition

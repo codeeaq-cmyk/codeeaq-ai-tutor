@@ -1002,7 +1002,8 @@ export function useCeeqVoice({ getToken, onToolCall, onTurnEnd, onStudentInput, 
           afterStudentRef.current = true;
           expectReply();
           session.sendRealtimeInput({ text: unanswered });
-        } else if (due || !carry.lastWords) {
+        } else if ((due || !carry.lastWords) && !pendingPromptRef.current) {
+          // A prompt the app has waiting is put to her once the connection is open (see openSession), in place of this one.
           expectReply();
           session.sendClientContent({ turns: [...history, { role: "user", parts: [{ text: carry.prompt }] }], turnComplete: true });
         } else {
@@ -1075,6 +1076,11 @@ export function useCeeqVoice({ getToken, onToolCall, onTurnEnd, onStudentInput, 
     setStatus("idle");
   }, [teardown]);
 
+  /** Call from a click, before anything that makes it wait: browsers only let sound play that a click started. */
+  const unlockSound = useCallback(() => {
+    ensurePlayback();
+  }, [ensurePlayback]);
+
   /** The student is doing something other than talking (answering the quiz, say): the lesson is not to be paused as idle. */
   const stillHere = useCallback(() => {
     if (statusRef.current === "live") touch();
@@ -1109,6 +1115,7 @@ export function useCeeqVoice({ getToken, onToolCall, onTurnEnd, onStudentInput, 
     sendText,
     notify,
     stillHere,
+    unlockSound,
     getLevel,
     /** Whether a lesson is being connected right now (the status only says so after the next render). */
     isStarting: () => startingRef.current === generationRef.current,

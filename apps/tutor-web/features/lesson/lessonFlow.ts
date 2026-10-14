@@ -1,4 +1,5 @@
 import { bestAttempt, moduleState, weakGoals, type LessonMode, type ModulePlan, type ModuleProgress } from "@codeeaq/shared-types";
+import { CHECK_IN_MS, type Lapse } from "../attention/attention";
 
 // The app's side of a lesson. A module runs in three parts: Ceeq explains it,
 // then practises it with the student, then the app gives a quiz.
@@ -241,3 +242,43 @@ export const MAX_HOLD_MS = 6000;
 export const GAP_AFTER_STUDENT_MS = 2500;
 /** If nothing at all happens for this long while she should be explaining, prompt her anyway. */
 export const SILENCE_MS = 9000;
+
+// ---------- The student out of view ----------
+//
+// The student's camera is on during a lesson (see features/attention). When
+// they have been out of view for a while, Ceeq checks in with them; when the
+// lesson had to be paused for them, she welcomes them back.
+
+/** Back after less than this, a lesson that was paused for the student simply carries on from the word it stopped at. */
+export const QUIET_RETURN_MS = 20_000;
+
+const LAPSE_SAID: Record<Lapse, string> = {
+  away: "has not been in front of the camera",
+  turned: "has been turned away from the screen",
+};
+
+/** Ceeq checks in with a student who has been out of view for a while. `mode` is the part the lesson is in. */
+export function checkIn(why: Lapse, mode: LessonMode): string {
+  const what = `For about ${CHECK_IN_MS / 1000} seconds the student ${LAPSE_SAID[why]}.`;
+  const after = "Then stop and wait for them. Do not scold them, and do not mention it again afterwards.";
+  return mode === "explain"
+    ? `(${what} Do not go on explaining in this turn. Check in with them instead, kindly and in one short sentence: ask whether they are still with you, or ask a light question about what you have just explained. ${after})`
+    : `(${what} They may have missed what you said. Check in with them, kindly and in one short sentence, and if a question of yours is waiting for an answer, put it to them again briefly. ${after})`;
+}
+
+/** How long the student was away, as Ceeq is told it. */
+export function howLong(ms: number): string {
+  if (ms < 45_000) return `about ${Math.max(10, Math.round(ms / 10_000) * 10)} seconds`;
+  if (ms < 90_000) return "about a minute";
+  return `about ${Math.round(ms / 60_000)} minutes`;
+}
+
+/** The student is back after the lesson was paused for them: they were away from the screen, or had `left` it for another app. */
+export function welcomeBack(awayMs: number, mode: LessonMode, left: boolean): string {
+  const where = left ? "left the lesson for another app" : "was away from the screen";
+  const then =
+    mode === "explain"
+      ? "Then carry on explaining from there: tools first, then speak."
+      : "Then, if a question of yours was waiting for an answer, put it to them again; otherwise go on from where you were.";
+  return `(The student ${where} for ${howLong(awayMs)} and is back now. Welcome them back in a few warm words, without any telling-off, and recap in one sentence what you were saying when they went. ${then} ${PACE_REMINDER})`;
+}

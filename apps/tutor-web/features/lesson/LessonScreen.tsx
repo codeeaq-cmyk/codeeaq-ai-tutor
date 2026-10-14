@@ -25,6 +25,9 @@ import {
   type WeakGoal,
   type WeakSpot,
 } from "@codeeaq/shared-types";
+import { Watch, type Lapse, type Sight } from "@/features/attention/attention";
+import { SelfView } from "@/features/attention/SelfView";
+import { useCamera, type CameraState } from "@/features/attention/useCamera";
 import { Board } from "@/features/board/Board";
 import { Missing } from "@/features/chapter/ChapterScreen";
 import { QuizView, type QuizResult } from "@/features/quiz/QuizView";
@@ -41,6 +44,7 @@ import {
   CARRY_ON,
   carryOnLimit,
   carryOverNote,
+  checkIn,
   Evidence,
   EXPLAIN_AGAIN,
   GAP_AFTER_STUDENT_MS,
@@ -53,6 +57,7 @@ import {
   MAX_SILENT_TURNS,
   openingFor,
   PRACTISE_NOW,
+  QUIET_RETURN_MS,
   QUIZ_SHOWN,
   quizReport,
   quizResultPrompt,
@@ -62,6 +67,7 @@ import {
   SPEAK_UP,
   type Stage,
   startingMode,
+  welcomeBack,
   WRAP_UP,
 } from "./lessonFlow";
 
@@ -130,6 +136,12 @@ function Revision(props: LessonProps) {
 }
 
 type View = "lesson" | "quiz" | "done";
+/**
+ * Why the lesson is paused: the student paused it (or went to the quiz), or the
+ * app did, because they were out of view, had gone to another app or tab, or
+ * their camera had gone off.
+ */
+type PauseReason = "student" | "away" | "left" | "camera";
 /** How a revised topic went in this sitting. */
 type Outcome = "got" | "later";
 
@@ -158,6 +170,7 @@ function ModuleLesson({ target, plan, index, provisional, startWithQuiz, topics 
   // outside render and must see the value as it is now.
   const [mode, setModeState] = useState<LessonMode>(revising ? "practice" : "explain");
   const [paused, setPausedState] = useState(false);
+  const [pausedFor, setPausedFor] = useState<PauseReason | null>(null);
   const flow = useRef({
     mode: (revising ? "practice" : "explain") as LessonMode,
     paused: false,
@@ -183,7 +196,17 @@ function ModuleLesson({ target, plan, index, provisional, startWithQuiz, topics 
     boardGoal: null as number | null,
     /** How many updates the board had seen when her turn began: what she adds after that belongs to the turn. */
     boardMark: 0,
+    /** Why the lesson is paused, while it is. */
+    pausedFor: null as PauseReason | null,
+    /** The student has been out of view for a while: Ceeq is to check in with them at the next moment that suits. */
+    checkInDue: null as Lapse | null,
+    /** She has checked in with them, and the lesson waits for them before it goes on. */
+    checking: false,
+    /** When the student last went to another app or tab, or their camera went off. */
+    leftAt: 0,
   });
+  // Whether the student is with the lesson, from what their camera shows.
+  const watch = useRef(new Watch(0));
   // What the student has said in this sitting, which Ceeq's judgements must rest on.
   const evidence = useRef(new Evidence());
   const carryOnTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -191,9 +214,17 @@ function ModuleLesson({ target, plan, index, provisional, startWithQuiz, topics 
     flow.current.mode = next;
     setModeState(next);
   }, []);
-  const setPaused = useCallback((next: boolean) => {
+  const setPaused = useCallback((next: boolean, why: PauseReason = "student") => {
     flow.current.paused = next;
+    flow.current.pausedFor = next ? why : null;
     setPausedState(next);
+    setPausedFor(next ? why : null);
+  }, []);
+  /** The student is with the lesson again, or it starts afresh: nothing is waiting on them, and the watch starts again. */
+  const forgetLapse = useCallback(() => {
+    flow.current.checkInDue = null;
+    flow.current.checking = false;
+    watch.current.reset(Date.now());
   }, []);
   const setView = useCallback((next: View) => {
     flow.current.view = next;
@@ -365,6 +396,16 @@ function ModuleLesson({ target, plan, index, provisional, startWithQuiz, topics 
     // Held back to the limit, and nobody was heard to speak: it is the room that is loud.
     if (flow.current.held >= MAX_HOLD_MS) flow.current.noisy = true;
     flow.current.held = 0;
+    // She has checked in with a student who was out of view: the lesson waits for them.
+    if (flow.current.checking) return;
+    // The student has been out of view for a while: instead of her next step, she checks in with them.
+    const lapse = flow.current.checkInDue;
+    if (lapse) {
+      flow.current.checkInDue = null;
+      flow.current.checking = true;
+      voiceNow.notify(checkIn(lapse, "explain"));
+      return;
+    }
     // Her next turn starts here: what she puts on the board from now on belongs to it.
     flow.current.boardMark = boardRef.current.updates ?? 0;
     const prompts = ++flow.current.prompts;
@@ -379,6 +420,21 @@ function ModuleLesson({ target, plan, index, provisional, startWithQuiz, topics 
   useEffect(() => {
     carryOnRef.current = carryOn;
   }, [carryOn]);
+
+  /**
+   * In conversation, Ceeq checks in with a student who has been out of view as
+   * soon as she can: not while she is speaking, nor when something has been
+   * asked of her already (the end of her turn brings us back here). While she
+   * explains, the check-in takes the place of her next step instead (see carryOn).
+   */
+  const sendCheckIn = useCallback(() => {
+    const voiceNow = voiceRef.current;
+    const lapse = flow.current.checkInDue;
+    if (!voiceNow || !lapse || flow.current.paused || flow.current.mode === "explain" || voiceNow.isMidTurn() || voiceNow.isOwed()) return;
+    flow.current.checkInDue = null;
+    flow.current.checking = true;
+    voiceNow.notify(checkIn(lapse, flow.current.mode));
+  }, []);
 
   /**
    * Carries the lesson over to a new connection, where Ceeq is told where it
@@ -420,16 +476,20 @@ function ModuleLesson({ target, plan, index, provisional, startWithQuiz, topics 
         return;
       }
       if (flow.current.mode !== "explain") {
+        // A check-in that waited for her to finish speaking.
+        if (flow.current.checkInDue) return sendCheckIn();
         // In conversation the student is waiting on her: a turn in which she said nothing must not be left at that.
         if (silent && flow.current.silences <= MAX_SILENT_TURNS) voiceRef.current?.notify(SPEAK_UP);
         return;
       }
+      // She has asked whether the student is with her: the lesson waits for them.
+      if (flow.current.checking) return;
       // After she has answered the student, let it all play out and leave room
       // for a follow-up. Otherwise prompt just before the paragraph ends.
       const wait = afterStudent ? remainingMs + GAP_AFTER_STUDENT_MS : Math.max(0, remainingMs - LEAD_MS);
       carryOnTimer.current = setTimeout(carryOn, wait);
     },
-    [cancelCarryOn, carryOn],
+    [cancelCarryOn, carryOn, sendCheckIn],
   );
 
   // When the student speaks or types, hold the prompt back (Ceeq will answer
@@ -438,6 +498,10 @@ function ModuleLesson({ target, plan, index, provisional, startWithQuiz, topics 
   const onStudentInput = useCallback(() => {
     evidence.current.studentSpoke();
     cancelCarryOn();
+    // Whatever the camera shows, someone who speaks or types is with the lesson.
+    watch.current.heard(Date.now());
+    flow.current.checkInDue = null;
+    flow.current.checking = false;
     flow.current.held = 0;
     flow.current.boardMark = boardRef.current.updates ?? 0;
     if (!flow.current.paused) return;
@@ -466,6 +530,7 @@ function ModuleLesson({ target, plan, index, provisional, startWithQuiz, topics 
       flow.current.finished = false;
       flow.current.boardGoal = null;
       flow.current.boardMark = boardRef.current.updates ?? 0;
+      forgetLapse();
       setQuizTaken(false);
       // A new connection is a new conversation: nothing has been said in it yet.
       evidence.current = new Evidence();
@@ -492,7 +557,7 @@ function ModuleLesson({ target, plan, index, provisional, startWithQuiz, topics 
       setMode(startIn);
       void voiceNow.connect(openingFor(mod, saved, Date.now(), startIn));
     },
-    [cancelCarryOn, mod, topics, setMode, setPaused, setQuizTaken, setView, target.key],
+    [cancelCarryOn, forgetLapse, mod, topics, setMode, setPaused, setQuizTaken, setView, target.key],
   );
 
   // Ceeq cannot be heard from, or soon will not be. If she has simply said
@@ -558,7 +623,34 @@ function ModuleLesson({ target, plan, index, provisional, startWithQuiz, topics 
 
   useEffect(() => cancelCarryOn, [cancelCarryOn]);
 
-  const start = useCallback(() => begin(voice), [begin, voice]);
+  // ---------- The student's camera ----------
+  //
+  // A lesson needs the student's camera, so that Ceeq can tell whether they are
+  // with her. It is looked at on their own device only (see features/attention):
+  // out of view for a while, Ceeq checks in with them; out of view for longer,
+  // or in another app, the lesson pauses, and carries on when they are back.
+  // What a look means is worked out further down, so it is reached through a ref.
+  const attendRef = useRef<(sight: Sight, now: number) => void>(() => {});
+  const onSight = useCallback((sight: Sight, now: number) => attendRef.current(sight, now), []);
+  const camera = useCamera(onSight);
+  const { turnOn: cameraOn, turnOff: cameraOff, getState: cameraState } = camera;
+
+  /** Starts the lesson, which needs the camera: the student is asked for it first. */
+  const startLesson = useCallback(
+    async (part?: LessonMode) => {
+      // Sound must be allowed while this is still the student's click, before waiting for the camera.
+      voice.unlockSound();
+      if (!(await cameraOn())) return;
+      begin(voice, part);
+    },
+    [begin, cameraOn, voice],
+  );
+  const start = useCallback(() => void startLesson(), [startLesson]);
+
+  // The camera is on only while the lesson runs.
+  useEffect(() => {
+    if (voice.status !== "live" && voice.status !== "connecting") cameraOff();
+  }, [voice.status, cameraOff]);
 
   // ---------- Pausing, and moving between the parts ----------
   //
@@ -568,25 +660,124 @@ function ModuleLesson({ target, plan, index, provisional, startWithQuiz, topics 
   // not in takes it there: Ceeq is told, and starts that part.
 
   /** Freezes the lesson where it is: Ceeq stops in the middle of her word, and stops listening. */
-  const pauseLesson = useCallback(() => {
-    if (flow.current.paused) return;
-    setPaused(true);
-    cancelCarryOn();
-    voice.hold();
-  }, [cancelCarryOn, setPaused, voice]);
+  const pauseLesson = useCallback(
+    (why: PauseReason = "student") => {
+      if (flow.current.paused) return;
+      setPaused(true, why);
+      cancelCarryOn();
+      voice.hold();
+    },
+    [cancelCarryOn, setPaused, voice],
+  );
 
   /** Carries on from exactly where the lesson was paused, however long ago. */
   const resumeLesson = useCallback(() => {
     if (!flow.current.paused) return;
     setPaused(false);
+    forgetLapse();
     // If something is already on its way from her, its end will see that she is asked to carry on.
     const coming = voice.isMidTurn() || voice.isOwed();
     // After a long pause the connection is gone: the lesson carries on over a new one.
     if (voice.release()) carryOver(voice);
     if (!coming) carryOnTimer.current = setTimeout(carryOn, Math.max(0, voice.remainingMs() - LEAD_MS));
-  }, [carryOn, carryOver, setPaused, voice]);
+  }, [carryOn, carryOver, forgetLapse, setPaused, voice]);
 
   const togglePause = useCallback(() => (flow.current.paused ? resumeLesson() : pauseLesson()), [pauseLesson, resumeLesson]);
+
+  /**
+   * The student is back to a lesson the app paused for them. After a short
+   * while away it simply carries on from the word it stopped at. After a longer
+   * one, Ceeq welcomes them back and picks up the thread. `left`: they had gone
+   * to another app or tab, rather than away from the screen.
+   */
+  const comeBack = useCallback(
+    (awayMs: number, left: boolean) => {
+      if (!flow.current.paused || flow.current.pausedFor === "student") return;
+      if (awayMs < QUIET_RETURN_MS) return resumeLesson();
+      setPaused(false);
+      forgetLapse();
+      cancelCarryOn();
+      if (voice.release()) carryOver(voice);
+      // What she was in the middle of saying is dropped: she recaps it instead.
+      voice.notify(welcomeBack(awayMs, flow.current.mode, left), true);
+    },
+    [cancelCarryOn, carryOver, forgetLapse, resumeLesson, setPaused, voice],
+  );
+
+  // What each look at the camera means for the lesson.
+  const attend = useCallback(
+    (sight: Sight, now: number) => {
+      const { view: viewNow, paused: pausedNow, pausedFor: why } = flow.current;
+      // Watched only while the lesson runs on the board and is not paused for anything but this.
+      if (voice.status !== "live" || viewNow !== "lesson" || (pausedNow && why !== "away")) {
+        watch.current.reset(now);
+        return;
+      }
+      const change = watch.current.look(sight, now);
+      if (!change) return;
+      if (change.kind === "check-in") {
+        flow.current.checkInDue = change.why;
+        sendCheckIn();
+      } else if (change.kind === "pause") {
+        pauseLesson("away");
+      } else if (change.from === "paused") {
+        comeBack(change.awayMs, false);
+      } else {
+        // Back before the lesson had to be paused. If she was waiting for them while explaining, she goes on.
+        const waited = flow.current.checking;
+        flow.current.checkInDue = null;
+        flow.current.checking = false;
+        if (waited && flow.current.mode === "explain" && !carryOnTimer.current && !voice.isMidTurn() && !voice.isOwed()) {
+          carryOnTimer.current = setTimeout(carryOn, voice.remainingMs() + GAP_AFTER_STUDENT_MS);
+        }
+      }
+    },
+    [carryOn, comeBack, pauseLesson, sendCheckIn, voice],
+  );
+  useEffect(() => {
+    attendRef.current = attend;
+  }, [attend]);
+
+  /** Turns the camera back on, from the button shown when it went off in the middle of the lesson. */
+  const turnCameraOn = useCallback(async () => {
+    if ((await cameraOn()) && flow.current.pausedFor === "camera") comeBack(Date.now() - flow.current.leftAt, false);
+  }, [cameraOn, comeBack]);
+  useEffect(() => {
+    if (camera.state !== "lost" || voice.status !== "live" || flow.current.view !== "lesson") return;
+    // It is needed to carry on. If the lesson was already paused for another reason, that stands.
+    if (!flow.current.paused) {
+      flow.current.leftAt = Date.now();
+      pauseLesson("camera");
+    }
+  }, [camera.state, pauseLesson, voice.status]);
+
+  // Going to another app or tab pauses the lesson at once, so that nothing is
+  // missed, and coming back carries it on. Phones may take the camera back
+  // meanwhile: it is turned on again first.
+  useEffect(() => {
+    const onVisibility = () => {
+      const now = Date.now();
+      if (document.visibilityState === "hidden") {
+        if (voice.status === "live" && flow.current.view === "lesson" && !flow.current.paused) {
+          flow.current.leftAt = now;
+          pauseLesson("left");
+        }
+        return;
+      }
+      watch.current.reset(now);
+      if (flow.current.pausedFor !== "left") return;
+      void (async () => {
+        if (cameraState() === "lost" && !(await cameraOn())) {
+          // Still no camera: the lesson stays paused until it is turned on.
+          setPaused(true, "camera");
+          return;
+        }
+        comeBack(now - flow.current.leftAt, true);
+      })();
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => document.removeEventListener("visibilitychange", onVisibility);
+  }, [cameraOn, cameraState, comeBack, pauseLesson, setPaused, voice.status]);
 
   /** The student goes to the quiz of their own accord: the lesson waits for them where it is. */
   const openQuiz = useCallback(() => {
@@ -614,7 +805,7 @@ function ModuleLesson({ target, plan, index, provisional, startWithQuiz, topics 
     (part: Part) => {
       if (part === "quiz") return openQuiz();
       // Not running: the lesson starts in that part.
-      if (voice.status !== "live") return begin(voice, part);
+      if (voice.status !== "live") return void startLesson(part);
       // Already in that part (they are coming back from the quiz, or it is paused): it carries on.
       if (flow.current.mode === part && !flow.current.finished) return backToLesson();
       // Otherwise Ceeq is told to change part, and what she was saying is dropped.
@@ -629,7 +820,7 @@ function ModuleLesson({ target, plan, index, provisional, startWithQuiz, topics 
       if (parked) carryOver(voice);
       voice.notify(part === "explain" ? EXPLAIN_AGAIN : PRACTISE_NOW, true);
     },
-    [backToLesson, begin, cancelCarryOn, carryOver, openQuiz, setMode, setPaused, setView, voice],
+    [backToLesson, cancelCarryOn, carryOver, openQuiz, setMode, setPaused, setView, startLesson, voice],
   );
 
   // On arrival: keep a single-lesson fallback plan so progress can be saved,
@@ -645,9 +836,9 @@ function ModuleLesson({ target, plan, index, provisional, startWithQuiz, topics 
     // by the first mount would be abandoned when that mount is torn down,
     // leaving the lesson stuck on "Connecting…".
     if (startWithQuiz || !navigator.userActivation?.hasBeenActive) return;
-    const timer = setTimeout(() => begin(voice), 0);
+    const timer = setTimeout(() => void startLesson(), 0);
     return () => clearTimeout(timer);
-    // Run once per module; `voice` changes identity on every render.
+    // Run once per module; `voice`, and so `startLesson`, change identity on every render.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -701,7 +892,10 @@ function ModuleLesson({ target, plan, index, provisional, startWithQuiz, topics 
         : state === "learning"
           ? "Continue lesson"
           : "Revisit lesson";
-  const notice = voice.error ?? (voice.status === "paused" ? (revising ? "Revision paused." : "Lesson paused.") : null);
+  const cameraNotice = live || busy ? undefined : CAMERA_NOTICE[camera.state];
+  const notice = cameraNotice ?? voice.error ?? (voice.status === "paused" ? (revising ? "Revision paused." : "Lesson paused.") : null);
+  const selfView = (compact: boolean) =>
+    live && <SelfView stream={camera.stream} sight={camera.sight} state={camera.state} onTurnOn={() => void turnCameraOn()} compact={compact} />;
   // Before the lesson is running, show the part it will start in.
   const part: Part = view === "quiz" ? "quiz" : live || busy ? mode : startingMode(progress);
   const explaining = live && view === "lesson" && mode === "explain";
@@ -712,7 +906,7 @@ function ModuleLesson({ target, plan, index, provisional, startWithQuiz, topics 
         ? `The lesson is paused while you are at the quiz. Go back to ${revising ? "the whiteboard" : PARTS.find((p) => p.id === mode)?.label} and it carries on from where it stopped.`
         : null
       : paused
-        ? "Paused. Press play to carry on from where it stopped."
+        ? PAUSED_HINT[pausedFor ?? "student"]
         : revising
           ? "Ceeq goes over each topic, then asks you about it. Answer out loud, or type."
           : mode === "explain"
@@ -769,7 +963,10 @@ function ModuleLesson({ target, plan, index, provisional, startWithQuiz, topics 
       {/* On wide screens these live in Ceeq's panel. */}
       <div className="flex items-center justify-between gap-2 overflow-x-auto border-b border-line bg-surface px-3 py-2 sm:px-5 lg:hidden">
         {parts || <span />}
-        {transcriptToggle}
+        <div className="flex shrink-0 items-center gap-2">
+          {selfView(true)}
+          {transcriptToggle}
+        </div>
       </div>
 
       <div className="flex min-h-0 flex-1">
@@ -807,12 +1004,13 @@ function ModuleLesson({ target, plan, index, provisional, startWithQuiz, topics 
 
         <aside className="hidden w-104 shrink-0 flex-col gap-6 overflow-y-auto border-l border-line bg-bg p-6 lg:flex xl:w-120">
           <CeeqOrb activity={paused ? "idle" : voice.activity} getLevel={voice.getLevel} />
+          {selfView(false)}
           {!live && (
             <div>
               <PrimaryButton onClick={start} disabled={busy} className="w-full text-lg">
                 {startLabel}
               </PrimaryButton>
-              {notice && <p className="mt-2 text-sm text-muted">{notice}</p>}
+              <p className="mt-2 text-sm text-muted">{notice ?? CAMERA_NOTE}</p>
             </div>
           )}
           {revising ? (
@@ -846,7 +1044,7 @@ function ModuleLesson({ target, plan, index, provisional, startWithQuiz, topics 
 
       {/* On wide screens the start button lives in Ceeq's panel, so the bar only shows during a lesson. */}
       <footer className={`border-t border-line bg-surface px-3 py-3 sm:px-5 ${live ? "" : "lg:hidden"}`}>
-        {notice && <p className={`mb-2 text-sm text-muted ${live ? "text-center" : "text-right"}`}>{notice}</p>}
+        {(notice || !live) && <p className={`mb-2 text-sm text-muted ${live ? "text-center" : "text-right"}`}>{notice ?? CAMERA_NOTE}</p>}
         {/* On wide screens Ceeq's panel says so. */}
         {live && paused && hint && <p className="mb-2 text-center text-sm text-muted lg:hidden">{hint}</p>}
         {live && transcript && voice.caption && view === "lesson" && (
@@ -910,6 +1108,25 @@ function ModuleLesson({ target, plan, index, provisional, startWithQuiz, topics 
     </div>
   );
 }
+
+/** Said beside the Start button: the lesson needs the camera, and what it is for. */
+const CAMERA_NOTE = "Ceeq needs your camera to check you’re with the lesson. It stays on this device: nothing is recorded or sent.";
+
+/** What the student is told while the camera is being asked for, or when it cannot be had. */
+const CAMERA_NOTICE: Partial<Record<CameraState, string>> = {
+  starting: "Allow the camera to start the lesson.",
+  blocked: "Ceeq needs your camera to start the lesson. Allow the camera for this site in your browser’s settings, then press Start again.",
+  missing: "Ceeq needs a camera to start the lesson, and none was found on this device.",
+  busy: "Your camera couldn’t be started. Close any other app that is using it, then press Start again.",
+};
+
+/** What a paused lesson says, by why it is paused. */
+const PAUSED_HINT: Record<PauseReason, string> = {
+  student: "Paused. Press play to carry on from where it stopped.",
+  away: "Paused while Ceeq couldn’t see you. It carries on when you’re back in front of the camera, or press play.",
+  left: "Paused while you were in another app. It carries on when you come back.",
+  camera: "Paused: your camera went off. Turn it back on to carry on.",
+};
 
 type Part = LessonMode | "quiz";
 
