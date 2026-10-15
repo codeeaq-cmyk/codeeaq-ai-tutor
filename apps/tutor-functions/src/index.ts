@@ -3,11 +3,14 @@ import { HttpsError, onCall, type CallableRequest } from 'firebase-functions/v2/
 import { defineSecret, defineString } from 'firebase-functions/params';
 import {
   FUNCTIONS_REGION,
+  parsePictureNotes,
   parseProfile,
   parseRevisionTopics,
   type ChapterPlan,
   type ChapterRef,
   type GetChapterPlanRequest,
+  type GetPicturesRequest,
+  type GetPicturesResponse,
   type GetQuizRequest,
   type GetSyllabusRequest,
   type Quiz,
@@ -17,6 +20,8 @@ import {
 } from '@codeeaq/shared-types';
 import { createAsker, type Ask } from './ai';
 import { generateChapterPlan, generateQuiz } from './course';
+import { getModulePictures, type PictureMaker } from './pictures';
+import { firestorePictureStore, geminiPictureMaker, standInPictureMaker } from './pictureServices';
 import { findCuratedSyllabus } from './syllabus/curated';
 import { cachedSyllabus, generateSyllabus } from './syllabus/generate';
 import { mintVoiceToken } from './voice';
@@ -36,6 +41,10 @@ const courseModels = defineString('GEMINI_COURSE_MODELS', {
   default: 'gemini-3.5-flash-lite,gemini-flash-lite-latest,gemini-3.8-flash',
 });
 const liveModel = defineString('GEMINI_LIVE_MODEL', { default: 'models/gemini-3.1-flash-live-preview' });
+// Pictures are drawn once per module and kept for every student, so the best image model goes first.
+const imageModels = defineString('GEMINI_IMAGE_MODELS', { default: 'gemini-3-pro-image,gemini-3.1-flash-image' });
+// The models that check each picture against what it must show, before any student sees it.
+const checkModels = defineString('GEMINI_CHECK_MODELS', { default: 'gemini-3.1-pro-preview,gemini-3.8-flash' });
 const voiceName = defineString('GEMINI_VOICE', { default: 'Sulafat' });
 
 /** Every call must come from a student who has signed in with their phone number. */
@@ -68,6 +77,20 @@ function getSyllabusAsker(): Ask {
   if (syllabusAsker?.key !== key) syllabusAsker = { key, ask: createAsker(key, list(textModels.value()), 'fast-first', 20_000) };
   return syllabusAsker.ask;
 }
+
+// The pictures' planner, artist and checker. On the emulators, with CEEQ_STAND_IN_PICTURES=1, plain stand-in
+// cards are drawn instead, for trying the app before an image model can be used. Never in production.
+let pictureMaker: { key: string; make: PictureMaker } | undefined;
+function getPictureMaker(): PictureMaker {
+  const key = requireKey();
+  if (pictureMaker?.key !== key) {
+    const standIn = process.env.FUNCTIONS_EMULATOR === 'true' && process.env.CEEQ_STAND_IN_PICTURES === '1';
+    const make = standIn ? standInPictureMaker(getCourseAsker()) : geminiPictureMaker(key, getCourseAsker(), list(imageModels.value()), list(checkModels.value()));
+    pictureMaker = { key, make };
+  }
+  return pictureMaker.make;
+}
+const pictureStore = firestorePictureStore();
 
 function text(value: unknown, max: number): string | undefined {
   return typeof value === 'string' && value.trim() && value.length <= max ? value.trim() : undefined;
@@ -160,6 +183,29 @@ export const getQuiz = onCall<GetQuizRequest, Promise<Quiz>>(
   },
 );
 
+/**
+ * The pictures a module is taught from, drawn and checked once and kept for
+ * every student. The first request for a module makes them, which takes a
+ * minute or two; one that comes meanwhile waits for them. If they cannot be made
+ * (no image quota, say), the lesson goes on without them.
+ */
+export const getPictures = onCall<GetPicturesRequest, Promise<GetPicturesResponse>>(
+  { secrets: [geminiApiKey], timeoutSeconds: 540, memory: '1GiB' },
+  async (request) => {
+    requireStudent(request);
+    const ref = chapterRef(request.data);
+    const module = moduleRef(request.data);
+    try {
+      const deps = { maker: getPictureMaker(), store: pictureStore, now: Date.now, sleep: (ms: number) => new Promise<void>((r) => setTimeout(r, ms)) };
+      return await getModulePictures(deps, { ...ref, module });
+    } catch (err) {
+      if (err instanceof HttpsError) throw err;
+      logger.error('Pictures could not be made', { module: module.title, err: String(err).slice(0, 500) });
+      return { status: 'unavailable', pictures: [] };
+    }
+  },
+);
+
 /** Mints a one-use Gemini Live token for one module's lesson, or for a revision of its weak spots. */
 export const createVoiceSession = onCall<StartVoiceRequest, Promise<StartVoiceResponse>>(
   { secrets: [geminiApiKey], timeoutSeconds: 30 },
@@ -171,11 +217,13 @@ export const createVoiceSession = onCall<StartVoiceRequest, Promise<StartVoiceRe
     if (!chapterModules) throw new HttpsError('invalid-argument', 'chapterModules must be a list of titles');
     const revise = request.data.revise === undefined ? undefined : parseRevisionTopics(request.data.revise, module.goals.length);
     if (revise === null) throw new HttpsError('invalid-argument', 'revise must list goals of this module');
+    const pictures = parsePictureNotes(request.data.pictures, module.goals.length);
+    if (pictures === null) throw new HttpsError('invalid-argument', 'pictures must describe pictures for goals of this module');
 
     const key = requireKey();
     const model = liveModel.value();
     try {
-      const token = await mintVoiceToken(key, model, voiceName.value(), { ...ref, module, chapterModules, ...(revise ? { revise } : {}) });
+      const token = await mintVoiceToken(key, model, voiceName.value(), { ...ref, module, chapterModules, pictures, ...(revise ? { revise } : {}) });
       return { token, model };
     } catch (err) {
       logger.error('Gemini voice token mint failed', { model, err: String(err) });

@@ -3,8 +3,11 @@
 // The model only sends data. It never sends markup, code or CSS, and nothing
 // reaches the screen without passing validateBoardUpdate.
 //
-// Every picture on it is the app's own. Photos searched for on the web were
-// tried and dropped: too often they showed something else.
+// Pictures of real things (a leaf and its parts, a circuit) are drawn for the
+// module before the lesson and checked before anyone sees them (see
+// pictures.ts); one at a time stands on the board, beside the blocks. Photos
+// searched for on the web were tried and dropped: too often they showed
+// something else.
 
 export const BOARD_COLORS = ['accent', 'blue', 'green', 'amber', 'red', 'gray'] as const;
 export type BoardColor = (typeof BOARD_COLORS)[number];
@@ -119,6 +122,21 @@ export interface BoardUpdate {
   remove?: string[];
   add?: BoardBlock[];
   highlight?: string | null;
+  /** The id of a prepared picture to put on the board. The app looks it up (see showPicture). */
+  picture?: string;
+}
+
+/** A prepared picture, as it stands on the board. */
+export interface BoardPicture {
+  id: string;
+  src: string;
+  title: string;
+  /** What it shows, for those who cannot see it. */
+  alt: string;
+  /** For a picture that builds up: how it looks after each stage but the last. It plays them in order. */
+  frames?: string[];
+  /** The number of the update that put it up, as for blocks (see BoardState.born). */
+  born: number;
 }
 
 export interface BoardState {
@@ -144,6 +162,8 @@ export interface BoardState {
    * stand as they are; only the new ones are written.
    */
   kept?: Record<string, number>;
+  /** The prepared picture on the board, if there is one. It stands below the first heading. */
+  picture?: BoardPicture;
 }
 
 export const EMPTY_BOARD: BoardState = { blocks: [], highlight: null };
@@ -158,8 +178,20 @@ export function applyBoardUpdate(board: BoardState, update: BoardUpdate): BoardS
   // Wipe only when there is something to show instead; otherwise remember to.
   const wipe = wantsClear && adding;
   const from: BoardState = wipe ? { ...EMPTY_BOARD, updates: board.updates } : { blocks: board.blocks, highlight: board.highlight, born: board.born, updates: board.updates, kept: board.kept };
-  const result = applyTo(from, update);
-  return wantsClear && !adding && board.blocks.length > 0 ? { ...result, clearPending: true } : result;
+  const applied = applyTo(from, update);
+  // The picture goes with a wipe, like everything else on the board.
+  const result = !wipe && board.picture ? { ...applied, picture: board.picture } : applied;
+  return wantsClear && !adding && (board.blocks.length > 0 || board.picture) ? { ...result, clearPending: true } : result;
+}
+
+/**
+ * Puts a prepared picture on the board, in place of any picture there. It is
+ * something new to show, so a wipe that was waiting for one is carried out.
+ */
+export function showPicture(board: BoardState, picture: Omit<BoardPicture, 'born'>): BoardState {
+  const updates = (board.updates ?? 0) + 1;
+  const kept: BoardState = board.clearPending ? { ...EMPTY_BOARD } : { blocks: board.blocks, highlight: board.highlight, born: board.born, kept: board.kept };
+  return { ...kept, updates, picture: { ...picture, born: updates } };
 }
 
 function applyTo(board: BoardState, update: BoardUpdate): BoardState {
@@ -228,8 +260,9 @@ function sharedLines(old: BoardBlock, block: BoardBlock): number {
  */
 export function startTopic(board: BoardState, since: number): BoardState {
   const fresh = board.blocks.filter((b) => (board.born?.[b.id] ?? 0) > since);
-  if (fresh.length === board.blocks.length) return board;
-  if (!fresh.length) return { ...board, clearPending: true };
+  const picture = board.picture && board.picture.born > since ? board.picture : undefined;
+  if (fresh.length === board.blocks.length && picture === board.picture) return board;
+  if (!fresh.length && !picture) return { ...board, clearPending: true };
   const born: Record<string, number> = {};
   const kept: Record<string, number> = {};
   for (const b of fresh) {
@@ -237,7 +270,7 @@ export function startTopic(board: BoardState, since: number): BoardState {
     kept[b.id] = board.kept?.[b.id] ?? 0;
   }
   const highlight = board.highlight && fresh.some((b) => b.id === board.highlight) ? board.highlight : null;
-  return { blocks: fresh, highlight, born, kept, updates: board.updates };
+  return { blocks: fresh, highlight, born, kept, updates: board.updates, ...(picture ? { picture } : {}) };
 }
 
 // ---------- Validation ----------
@@ -574,6 +607,13 @@ export function validateBoardUpdate(args: unknown): { update: BoardUpdate; error
   if (Array.isArray(args.add)) {
     const add: BoardBlock[] = [];
     args.add.slice(0, 8).forEach((raw, i) => {
+      // A prepared picture is not a block: it is looked up by its id, and stands beside them.
+      if (isObj(raw) && raw.kind === 'picture') {
+        const id = str(raw.id, 40) ?? str(raw.picture, 40);
+        if (id) update.picture = id;
+        else errors.push(`add[${i}] is a picture with no id: give the id of one of the prepared pictures.`);
+        return;
+      }
       const b = block(raw, `b${++autoId}`);
       if (b) add.push(b);
       else errors.push(`add[${i}] was not a valid block and was skipped.`);
@@ -600,7 +640,7 @@ const colorSchema = { type: 'string', enum: [...BOARD_COLORS] };
 export const WHITEBOARD_TOOL = {
   name: 'whiteboard',
   description:
-    'Update the whiteboard next to you. Blocks stack top to bottom automatically and are drawn in front of the student, one after another, as you speak. Every explanation needs a visual block (panels, flow, labelled, diagram, graph, number_line or table), not only text. A "picture" is always ONE emoji that plainly shows the thing itself (☀️ sun, 🌱 plant, 💧 water, 🔥 flame, 🔋 battery, 💡 bulb, 🧲 magnet, 🫀 heart, 🌍 earth, 🏭 factory); leave it out when no emoji shows the thing. Keep text short. Re-using an id replaces that block, so you can build a diagram up step by step.',
+    'Update the whiteboard next to you. Blocks stack top to bottom automatically and are drawn in front of the student, one after another, as you speak. Every explanation needs something to look at: a prepared picture, or a panels, flow, diagram, graph, number_line or table block, not only text. A prepared picture is shown with a block {"kind": "picture", "id": "<its id>"}; there is one on the board at a time. In panels and flow, a "picture" is ONE emoji, and only where the emoji is that very thing (☀️ the sun, 💧 water, 🔥 a flame, 🔋 a battery, 💡 a bulb, 🧲 a magnet); never use one to stand for a part, a place or an idea, and leave it out whenever in doubt. Keep text short. Re-using an id replaces that block, so you can build a diagram up step by step.',
   parametersJsonSchema: {
     type: 'object',
     properties: {
@@ -618,11 +658,11 @@ export const WHITEBOARD_TOOL = {
           properties: {
             kind: {
               type: 'string',
-              enum: ['heading', 'text', 'math', 'list', 'callout', 'table', 'number_line', 'graph', 'diagram', 'panels', 'flow', 'labelled', 'notes'],
+              enum: ['heading', 'text', 'math', 'list', 'callout', 'table', 'number_line', 'graph', 'diagram', 'panels', 'flow', 'notes', 'picture'],
               description:
-                'panels: kinds, cases or examples side by side. flow: a process, cause and effect, or a cycle, as steps joined by arrows. labelled: one thing in the middle with what goes in, comes out or belongs to it on either side. notes: the lines the student should copy down for the goal you are teaching.',
+                'picture: one of the pictures prepared for this module, by its id. panels: kinds, cases or examples side by side. flow: a process, cause and effect, or a cycle, as steps joined by arrows. notes: the lines the student should copy down for the goal you are teaching.',
             },
-            id: { type: 'string', description: 'Short unique id, e.g. "def1".' },
+            id: { type: 'string', description: 'Short unique id, e.g. "def1". For a picture, the id of the prepared picture.' },
             text: { type: 'string', description: 'heading, text, callout. Inline maths goes between $...$.' },
             latex: { type: 'string', description: 'math: a LaTeX formula, e.g. "\\frac{a}{b}" or "\\ce{2H2 + O2 -> 2H2O}".' },
             items: { type: 'array', items: { type: 'string' }, description: 'list items (inline $maths$ allowed).' },
@@ -669,7 +709,7 @@ export const WHITEBOARD_TOOL = {
                 type: 'object',
                 properties: {
                   title: { type: 'string', description: 'Its name, 1 to 3 words.' },
-                  picture: { type: 'string', description: 'One emoji that shows it.' },
+                  picture: { type: 'string', description: 'One emoji, only if it is that very thing.' },
                   text: { type: 'string', description: 'One short line about it.' },
                   color: colorSchema,
                 },
@@ -683,7 +723,7 @@ export const WHITEBOARD_TOOL = {
                 type: 'object',
                 properties: {
                   label: { type: 'string', description: 'The step, 1 to 3 words.' },
-                  picture: { type: 'string', description: 'One emoji that shows it.' },
+                  picture: { type: 'string', description: 'One emoji, only if it is that very thing.' },
                   note: { type: 'string', description: 'A few words under the step.' },
                   then: { type: 'string', description: 'What happens on the way to the next step, 1 or 2 words written along the arrow, e.g. "evaporation".' },
                 },
@@ -697,23 +737,7 @@ export const WHITEBOARD_TOOL = {
               description:
                 'notes: the lines of the notes, each a complete statement of at most twelve words (inline $maths$ allowed). Use one notes block for a goal, with the same id every time, and send it with all its lines so far and the new one last: only the new line is written.',
             },
-            picture: { type: 'string', description: 'labelled: one emoji showing the thing in the middle.' },
-            title: { type: 'string', description: 'labelled: the name of the thing in the middle. notes: a heading for them, if "Notes" will not do.' },
-            labels: {
-              type: 'array',
-              description:
-                'labelled: up to 6 things around the middle. For what goes in and what comes out (photosynthesis: sunlight, water and carbon dioxide in; oxygen and glucose out) put inputs on the left with arrow "in" and outputs on the right with arrow "out". For parts or properties use arrow "none".',
-              items: {
-                type: 'object',
-                properties: {
-                  text: { type: 'string', description: 'The label, a few words.' },
-                  picture: { type: 'string', description: 'One emoji that shows it.' },
-                  side: { type: 'string', enum: ['left', 'right'] },
-                  arrow: { type: 'string', enum: ['in', 'out', 'none'] },
-                },
-                required: ['text'],
-              },
-            },
+            title: { type: 'string', description: 'notes: a heading for them, if "Notes" will not do.' },
             caption: { type: 'string', description: 'diagram or flow caption.' },
             shapes: {
               type: 'array',
@@ -721,8 +745,7 @@ export const WHITEBOARD_TOOL = {
               items: {
                 type: 'object',
                 properties: {
-                  type: { type: 'string', enum: ['circle', 'rect', 'line', 'polygon', 'text', 'picture', 'pie', 'bar'] },
-                  picture: { type: 'string', description: 'picture: one emoji, drawn centred on x, y (size 40 unless given), with label under it.' },
+                  type: { type: 'string', enum: ['circle', 'rect', 'line', 'polygon', 'text', 'pie', 'bar'] },
                   x: { type: 'number' },
                   y: { type: 'number' },
                   r: { type: 'number' },

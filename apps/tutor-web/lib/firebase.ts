@@ -6,6 +6,8 @@ import { FUNCTIONS_REGION } from "@codeeaq/shared-types";
 import type {
   ChapterPlan,
   GetChapterPlanRequest,
+  GetPicturesRequest,
+  GetPicturesResponse,
   GetQuizRequest,
   GetSyllabusRequest,
   Quiz,
@@ -46,6 +48,8 @@ const getSyllabusFn = httpsCallable<GetSyllabusRequest, Syllabus>(functions, "ge
 const getChapterPlanFn = httpsCallable<GetChapterPlanRequest, ChapterPlan>(functions, "getChapterPlan", { timeout: 95_000 });
 const getQuizFn = httpsCallable<GetQuizRequest, Quiz>(functions, "getQuiz", { timeout: 95_000 });
 const createVoiceSessionFn = httpsCallable<StartVoiceRequest, StartVoiceResponse>(functions, "createVoiceSession");
+// The first student to open a module waits while its pictures are drawn and checked: a few minutes at most.
+const getPicturesFn = httpsCallable<GetPicturesRequest, GetPicturesResponse>(functions, "getPictures", { timeout: 545_000 });
 
 export async function fetchSyllabus(request: GetSyllabusRequest) {
   return (await getSyllabusFn(request)).data;
@@ -61,4 +65,8 @@ export async function fetchChapterPlan(request: GetChapterPlanRequest) {
 
 export async function fetchQuiz(request: GetQuizRequest) {
   return (await getQuizFn(request)).data;
+}
+
+export async function fetchPictures(request: GetPicturesRequest) {
+  return (await getPicturesFn(request)).data;
 }

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { applyBoardUpdate, EMPTY_BOARD, startTopic, validateBoardUpdate } from './board.js';
+import { applyBoardUpdate, EMPTY_BOARD, showPicture, startTopic, validateBoardUpdate } from './board.js';
 import {
   bestAttempt,
   chapterMastery,
@@ -387,5 +387,43 @@ describe('parseProfile', () => {
     });
     expect(parseProfile({ board: 'cbse', classLevel: 12, language: 'en' })).toBeNull();
     expect(parseProfile({ board: 'nope', classLevel: 10, language: 'en' })).toBeNull();
+  });
+});
+
+describe('prepared pictures on the board', () => {
+  const leaf = { id: 'leaf-parts', src: 'data:image/webp;base64,AAAA', title: 'Parts of a leaf', alt: 'A leaf with its parts named.' };
+
+  it('takes a picture block as the id of a prepared picture to show, not as a block', () => {
+    const { update, errors } = validateBoardUpdate({ add: [{ kind: 'heading', id: 'h', text: 'The leaf' }, { kind: 'picture', id: 'leaf-parts' }] });
+    expect(errors).toEqual([]);
+    expect(update.add).toEqual([{ kind: 'heading', id: 'h', text: 'The leaf' }]);
+    expect(update.picture).toBe('leaf-parts');
+    expect(validateBoardUpdate({ add: [{ kind: 'picture' }] }).errors).toHaveLength(1);
+  });
+
+  it('shows one picture at a time, and carries out a wipe that was waiting for something new', () => {
+    const old = applyBoardUpdate(EMPTY_BOARD, { add: [{ kind: 'heading', id: 'h1', text: 'Goal one' }] });
+    const waiting = startTopic(old, old.updates ?? 0);
+    expect(waiting.clearPending).toBe(true);
+    const shown = showPicture(waiting, leaf);
+    expect(shown.blocks).toEqual([]);
+    expect(shown.clearPending).toBeUndefined();
+    expect(shown.picture).toEqual({ ...leaf, born: 2 });
+    // Another picture takes its place.
+    expect(showPicture(shown, { ...leaf, id: 'veins' }).picture?.id).toBe('veins');
+  });
+
+  it('keeps the picture as blocks are added, and lets it go with a wipe or the next topic', () => {
+    const shown = showPicture(EMPTY_BOARD, leaf);
+    const added = applyBoardUpdate(shown, { add: [{ kind: 'heading', id: 'h', text: 'The leaf' }] });
+    expect(added.picture?.id).toBe('leaf-parts');
+    expect(applyBoardUpdate(added, { clear: true, add: [{ kind: 'heading', id: 'k', text: 'Key points' }] }).picture).toBeUndefined();
+    // A new topic, begun after the picture went up: it goes, once there is something to show instead.
+    const next = startTopic(added, added.updates ?? 0);
+    expect(next.clearPending).toBe(true);
+    expect(applyBoardUpdate(next, { add: [{ kind: 'heading', id: 'h2', text: 'Goal two' }] }).picture).toBeUndefined();
+    // Put up for the new topic itself, it stays.
+    const forIt = showPicture(startTopic(added, added.updates ?? 0), leaf);
+    expect(startTopic(forIt, added.updates ?? 0).picture?.id).toBe('leaf-parts');
   });
 });

@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import type { BoardBlock, BoardState, CalloutTone } from "@codeeaq/shared-types";
 import { Diagram, Graph, NumberLine } from "./Figures";
 import { MathBlock, MathText } from "./MathText";
+import { PictureCard } from "./PictureCard";
 import { drawTimes, ROW_MS, startAt, writeMs } from "./reveal";
 import { Flow, Labelled, Panels } from "./Scenes";
 
@@ -155,16 +156,20 @@ export function Board({ board, empty, paused = false }: { board: BoardState; emp
   useEffect(() => {
     const target = board.highlight ? document.getElementById(`block-${board.highlight}`) : endRef.current;
     target?.scrollIntoView({ behavior: "smooth", block: "nearest" });
-  }, [lastId, board.blocks.length, board.highlight]);
+  }, [lastId, board.blocks.length, board.highlight, board.picture?.born]);
 
-  if (!board.blocks.length) {
+  if (!board.blocks.length && !board.picture) {
     return <div className="flex h-full items-center justify-center p-8 text-center text-muted">{empty}</div>;
   }
 
   const times = drawTimes(board);
+  // A prepared picture stands below the board's first heading, or at the top if it has none.
+  const pictureAt = board.blocks.findIndex((b) => b.kind === "heading") + 1;
+  const picture = board.picture && <PictureCard key={`${board.picture.id}:${board.picture.born}`} picture={board.picture} paused={paused} />;
   return (
     <div className="mx-auto flex max-w-3xl flex-col gap-5 px-5 py-6 sm:px-8 sm:py-8" data-board-paused={paused || undefined}>
-      {board.blocks.map((block) => (
+      {pictureAt === 0 && picture}
+      {board.blocks.map((block, i) => [
         <div
           // A block that is replaced gets a new key, and so is drawn afresh.
           key={`${block.id}:${board.born?.[block.id] ?? 0}`}
@@ -174,8 +179,9 @@ export function Board({ board, empty, paused = false }: { board: BoardState; emp
           } ${block.kind === "heading" ? "" : "px-1"}`}
         >
           <Drawn block={block} at={times[block.id] ?? 0} kept={board.kept?.[block.id] ?? 0} />
-        </div>
-      ))}
+        </div>,
+        i + 1 === pictureAt && picture,
+      ])}
       <div ref={endRef} />
     </div>
   );

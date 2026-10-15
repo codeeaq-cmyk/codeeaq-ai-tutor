@@ -205,10 +205,13 @@ export function useCeeqVoice({ getToken, onToolCall, onTurnEnd, onStudentInput, 
 
   const tokenRef = useRef<{ at: number; promise: Promise<StartVoiceResponse> } | null>(null);
 
-  /** Mints a token ahead of time so starting the lesson doesn't wait on it. */
-  const prepare = useCallback(() => {
+  /**
+   * Mints a token ahead of time so starting the lesson doesn't wait on it.
+   * `fresh`: the lesson's instructions have changed, so one minted earlier will not do.
+   */
+  const prepare = useCallback((fresh = false) => {
     const t = tokenRef.current;
-    if (t && Date.now() - t.at < TOKEN_TTL_MS) return;
+    if (t && !fresh && Date.now() - t.at < TOKEN_TTL_MS) return;
     const promise = getToken();
     tokenRef.current = { at: Date.now(), promise };
     promise.catch(() => {
