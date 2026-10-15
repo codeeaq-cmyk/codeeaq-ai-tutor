@@ -8,4 +8,3 @@ export * from './syllabus.js';
 export * from './board.js';
 export * from './lesson.js';
 export * from './revision.js';
-export * from './pictures.js';

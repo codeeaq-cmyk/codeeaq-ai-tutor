@@ -1,9 +1,7 @@
 rules_version = '2';
 
 // Each student's record and progress can be read and written only by that
-// student, signed in with their phone number. The pictures drawn for each
-// module (modulePictures, pictureImages) are kept here too, but only the Cloud
-// Functions read and write them: no rule below lets a student near them.
+// student, signed in with their phone number. Nothing else is stored here.
 service cloud.firestore {
   match /databases/{database}/documents {
     match /students/{uid} {

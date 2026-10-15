@@ -1,4 +1,3 @@
-import type { PictureNote } from './pictures.js';
 import type { StudentProfile } from './profile.js';
 import type { RevisionTopic, WeakSpot } from './revision.js';
 import { slugify } from './syllabus.js';
@@ -209,8 +208,6 @@ export interface StartVoiceRequest extends ChapterRef {
   chapterModules: string[];
   /** Set for a revision lesson: the weak spots to go over, instead of teaching the whole module. */
   revise?: RevisionTopic[];
-  /** The pictures prepared for the module, if they are ready, so that Ceeq knows what she can show. */
-  pictures?: PictureNote[];
 }
 
 export interface StartVoiceResponse {

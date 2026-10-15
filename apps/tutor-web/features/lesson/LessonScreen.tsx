@@ -15,14 +15,12 @@ import {
   parseAnswer,
   parseProgressUpdate,
   revisionTopics,
-  showPicture,
   startTopic,
   validateBoardUpdate,
   type BoardState,
   type ChapterPlan,
   type GoalStatus,
   type LessonMode,
-  type ModulePicture,
   type ModulePlan,
   type WeakGoal,
   type WeakSpot,
@@ -39,7 +37,6 @@ import { useCeeqVoice, type ToolHandler } from "@/features/voice/useCeeqVoice";
 import { loadQuiz, prefetchQuiz, useChapterPlan } from "@/lib/course";
 import { startVoice } from "@/lib/firebase";
 import { readChapterProgress, savePlan, updateModule, useChapterProgress } from "@/lib/progress";
-import { noteOf, pictureShown, picturesReady, usePictures } from "@/lib/pictures";
 import { dayLabel, reasonFor } from "@/lib/revise";
 import { useChapterTarget, type ChapterRouteProps, type ChapterTarget } from "@/lib/target";
 import { useTranscript } from "@/lib/transcript";
@@ -207,19 +204,11 @@ function ModuleLesson({ target, plan, index, provisional, startWithQuiz, topics 
     checking: false,
     /** When the student last went to another app or tab, or their camera went off. */
     leftAt: 0,
-    /** The pictures came after she was connected: she is told of them with her next prompt to carry on. */
-    picturesNews: null as string | null,
   });
   // Whether the student is with the lesson, from what their camera shows.
   const watch = useRef(new Watch(0));
   // What the student has said in this sitting, which Ceeq's judgements must rest on.
   const evidence = useRef(new Evidence());
-  // The module's prepared pictures, once they have come (see lib/pictures.ts). Read by the callbacks below.
-  const pictures = usePictures(target.key, target.ref, mod);
-  const picturesRef = useRef<ModulePicture[]>(pictures);
-  useEffect(() => {
-    picturesRef.current = pictures;
-  }, [pictures]);
   const carryOnTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const setMode = useCallback((next: LessonMode) => {
     flow.current.mode = next;
@@ -249,8 +238,6 @@ function ModuleLesson({ target, plan, index, provisional, startWithQuiz, topics 
         module: { title: mod.title, goals: mod.goals },
         chapterModules: plan.modules.map((m) => m.title),
         ...(topics ? { revise: revisionTopics(topics) } : {}),
-        // Those that have come by the time the connection opens: Ceeq is told what they are.
-        ...(picturesRef.current.length ? { pictures: picturesRef.current.map(noteOf) } : {}),
       }),
     [target, mod, plan, topics],
   );
@@ -261,17 +248,7 @@ function ModuleLesson({ target, plan, index, provisional, startWithQuiz, topics 
       switch (name) {
         case "whiteboard": {
           const { update, errors } = validateBoardUpdate(args);
-          // A prepared picture she asks for by its id.
-          const wanted = update.picture === undefined ? undefined : picturesRef.current.find((p) => p.id === update.picture);
-          if (update.picture !== undefined && !wanted) {
-            const ids = picturesRef.current.map((p) => `"${p.id}"`);
-            errors.push(ids.length ? `There is no prepared picture "${update.picture}". The prepared ones are: ${ids.join(", ")}.` : "This module has no prepared pictures: describe it in words instead.");
-          }
-          setBoard((b) => {
-            const next = applyBoardUpdate(b, update);
-            // The one already up (the app may have put it there for her) is left as it is.
-            return wanted && next.picture?.id !== wanted.id ? showPicture(next, onBoard(wanted)) : next;
-          });
+          setBoard((b) => applyBoardUpdate(b, update));
           // Phrased so Ceeq corrects the call quietly instead of apologising out loud.
           return errors.length
             ? { ok: true, notShown: errors, note: "Other blocks are on the board. Resend the skipped ones with their required fields if needed. Do not mention this to the student." }
@@ -287,13 +264,10 @@ function ModuleLesson({ target, plan, index, provisional, startWithQuiz, topics 
           // A result with nothing from the student behind it is not recorded.
           if (status !== "learning" && !evidence.current.allowResult()) return { ok: true };
           // She has moved on to another goal: the last one's board is wiped, so that each goal is taught on a clean one.
-          // While she explains, the goal's prepared picture is put up for her, and she is told what it shows.
-          let shown: ModulePicture | undefined;
           if (status === "learning" && flow.current.boardGoal !== change.index) {
             flow.current.boardGoal = change.index;
             const since = flow.current.boardMark;
-            shown = flow.current.mode === "explain" ? picturesRef.current.find((p) => p.goal === change.index) : undefined;
-            setBoard((b) => (shown ? showPicture(startTopic(b, since), onBoard(shown)) : startTopic(b, since)));
+            setBoard((b) => startTopic(b, since));
           }
           const now = Date.now();
           let revisionOver = false;
@@ -316,8 +290,8 @@ function ModuleLesson({ target, plan, index, provisional, startWithQuiz, topics 
             setView("done");
             return { ok: true, note: "That was the last topic of this revision. Say in two sentences what the student did well, say goodbye, and stop. Do not begin another topic or ask another question." };
           }
-          // Otherwise deliberately no comment back: telling her so made her apologise to the student.
-          return shown ? { ok: true, note: pictureShown(noteOf(shown)) } : { ok: true };
+          // Deliberately no comment back: telling her so made her apologise to the student.
+          return { ok: true };
         }
         case "record_answer": {
           const answer = parseAnswer(args, mod.goals.length);
@@ -441,9 +415,7 @@ function ModuleLesson({ target, plan, index, provisional, startWithQuiz, topics 
       setMode("practice");
       return;
     }
-    const news = flow.current.picturesNews;
-    flow.current.picturesNews = null;
-    voiceNow.notify(`${news ? `${news} ` : ""}${prompts > limit ? WRAP_UP : CARRY_ON}`);
+    voiceNow.notify(prompts > limit ? WRAP_UP : CARRY_ON);
   }, [mod.goals.length, setMode]);
   useEffect(() => {
     carryOnRef.current = carryOn;
@@ -851,16 +823,6 @@ function ModuleLesson({ target, plan, index, provisional, startWithQuiz, topics 
     [backToLesson, cancelCarryOn, carryOver, openQuiz, setMode, setPaused, setView, startLesson, voice],
   );
 
-  // Pictures that come before the lesson starts are worth a fresh token, so that Ceeq is told of them from the
-  // start. If she is already connected, she is told of them with her next prompt; a new connection's token has them.
-  const { prepare: prepareVoice } = voice;
-  useEffect(() => {
-    if (!pictures.length) return;
-    const status = voiceRef.current?.status;
-    if (status === "live" || status === "connecting") flow.current.picturesNews = picturesReady(pictures.map(noteOf));
-    else prepareVoice(true);
-  }, [pictures, prepareVoice]);
-
   // On arrival: keep a single-lesson fallback plan so progress can be saved,
   // start writing the quiz so it is ready when the lesson ends, and mint the
   // voice token. All three are safe to repeat.
@@ -1165,9 +1127,6 @@ const PAUSED_HINT: Record<PauseReason, string> = {
   left: "Paused while you were in another app. It carries on when you come back.",
   camera: "Paused: your camera went off. Turn it back on to carry on.",
 };
-
-/** A prepared picture as it goes on the board. */
-const onBoard = ({ id, src, title, shows, frames }: ModulePicture) => ({ id, src, title, alt: `${title}: ${shows}`, ...(frames ? { frames } : {}) });
 
 type Part = LessonMode | "quiz";
 

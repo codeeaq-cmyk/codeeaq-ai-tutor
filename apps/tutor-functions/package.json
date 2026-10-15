@@ -9,7 +9,7 @@
   },
   "scripts": {
     "build": "tsc --noEmit && npm run bundle",
-    "bundle": "esbuild src/index.ts --bundle --platform=node --target=node22 --format=esm --outfile=lib/index.js --external:firebase-functions --external:firebase-admin --external:@google/genai --external:sharp",
+    "bundle": "esbuild src/index.ts --bundle --platform=node --target=node22 --format=esm --outfile=lib/index.js --external:firebase-functions --external:firebase-admin --external:@google/genai",
     "watch": "npm run bundle -- --watch",
     "test": "vitest run",
     "test:watch": "vitest"
@@ -17,8 +17,7 @@
   "dependencies": {
     "@google/genai": "^2.24.0",
     "firebase-admin": "^14.5.0",
-    "firebase-functions": "^7.4.0",
-    "sharp": "^0.35.5"
+    "firebase-functions": "^7.4.0"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
